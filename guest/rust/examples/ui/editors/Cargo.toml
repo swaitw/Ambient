@@ -1,5 +1,5 @@
 [package]
-name = "editors"
+name = "ambient_example_editors"
 
 edition = "2021"
 publish = false
@@ -7,18 +7,11 @@ rust-version = { workspace = true }
 version = { workspace = true }
 
 [dependencies]
-ambient_api = { path = "../../../api" }
-ambient_element = { path = "../../../../../crates/element", default-features = false, features = [
-  "guest",
-] }
-ambient_guest_bridge = { path = "../../../../../crates/guest_bridge", default-features = false, features = [
-  "guest",
-] }
-ambient_ui_components = { path = "../../../../../crates/ui_components", features = [
-  "guest",
-] }
-ambient_cb = { path = "../../../../../libs/cb" }
-indexmap = { version = "1", features = ["serde"] }
+ambient_api = { workspace = true }
+indexmap = { workspace = true }
+
+[build-dependencies]
+ambient_package_projection = { workspace = true }
 
 [[bin]]
 name = "ui_input_client"

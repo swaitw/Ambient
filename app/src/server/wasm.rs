@@ -1,71 +1,104 @@
-use std::{path::PathBuf, sync::Arc};
+use std::{fmt::Display, path::PathBuf, sync::Arc};
 
-use ambient_core::asset_cache;
-use ambient_ecs::{EntityId, SystemGroup, World};
-use ambient_project::Identifier;
-use ambient_std::{
-    asset_cache::SyncAssetKeyExt,
-    asset_url::{AssetUrl, ServerBaseUrlKey},
-};
+use ambient_ecs::{Entity, EntityId, SystemGroup, World};
+use ambient_native_std::asset_cache::AssetCache;
+use ambient_package_semantic_native::{WasmSpawnRequest, WasmSpawnResponse};
 pub use ambient_wasm::server::{on_forking_systems, on_shutdown_systems};
-use ambient_wasm::shared::{client_bytecode_from_url, get_module_name, module_bytecode, spawn_module, MessageType, ModuleBytecode};
-use anyhow::Context;
+use ambient_wasm::shared::{
+    bytecode_from_url, is_module, is_module_on_server, module_enabled, module_name, package_ref,
+    MessageType,
+};
 
 pub fn systems() -> SystemGroup {
     ambient_wasm::server::systems()
 }
 
-pub fn initialize(world: &mut World, project_path: PathBuf, manifest: &ambient_project::Manifest) -> anyhow::Result<()> {
-    let messenger = Arc::new(|world: &World, id: EntityId, type_: MessageType, message: &str| {
-        let name = get_module_name(world, id);
-        let (prefix, level) = match type_ {
-            MessageType::Info => ("info", log::Level::Info),
-            MessageType::Error => ("error", log::Level::Error),
-            MessageType::Stdout => ("stdout", log::Level::Info),
-            MessageType::Stderr => ("stderr", log::Level::Info),
-        };
+pub async fn initialize(
+    world: &mut World,
+    assets: &AssetCache,
+    data_path: PathBuf,
+) -> anyhow::Result<()> {
+    let messenger = Arc::new(
+        |world: &World, id: EntityId, ty: MessageType, message: &str| {
+            let module_name = world.get_cloned(id, module_name()).unwrap_or_default();
+            match ty {
+                MessageType::Info => tracing::info!(%module_name, "{}", message),
+                MessageType::Warn => tracing::warn!(%module_name, "{}", message),
+                MessageType::Error => tracing::error!(%module_name, "{}", message),
+                MessageType::Stdout => tracing::info!(%module_name, "stdout: {}", message),
+                MessageType::Stderr => tracing::info!(%module_name, "stderr: {}", message),
+            };
+        },
+    );
 
-        log::log!(level, "[{name}] {prefix}: {}", message.strip_suffix('\n').unwrap_or(message));
-    });
+    let hosted = std::env::var("AMBIENT_HOSTED").is_ok();
+    ambient_wasm::server::initialize(world, assets, hosted, data_path, messenger)?;
 
-    ambient_wasm::server::initialize(world, messenger)?;
+    Ok(())
+}
 
-    let build_dir = project_path.join("build");
-    for target in ["client", "server"] {
-        let wasm_component_paths: Vec<PathBuf> = std::fs::read_dir(build_dir.join(target))
-            .ok()
-            .map(|rd| rd.filter_map(Result::ok).map(|p| p.path()).filter(|p| p.extension().unwrap_or_default() == "wasm").collect())
-            .unwrap_or_default();
+/// `enabled` is passed here as we need knowledge of the other packages to determine if this package should be enabled or not
+pub fn spawn_package(
+    world: &mut World,
+    request: WasmSpawnRequest,
+) -> anyhow::Result<WasmSpawnResponse> {
+    let WasmSpawnRequest {
+        package_id,
+        client_modules: client_request,
+        server_modules: server_request,
+    } = request;
 
-        let is_sole_module = wasm_component_paths.len() == 1;
-        for path in wasm_component_paths {
-            let filename_identifier =
-                Identifier::new(&*path.file_stem().context("no file stem for {path:?}")?.to_string_lossy()).map_err(anyhow::Error::msg)?;
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    enum Side {
+        Client,
+        Server,
+    }
+    impl Side {
+        fn as_str(&self) -> &'static str {
+            match self {
+                Side::Client => "client",
+                Side::Server => "server",
+            }
+        }
+    }
+    impl Display for Side {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "{}", self.as_str())
+        }
+    }
 
-            let name = if is_sole_module {
-                manifest.project.id.clone()
+    // Spawn all of the modules for each side, collecting them as we go
+    let mut client_modules = vec![];
+    let mut server_modules = vec![];
+    for (target, modules) in [
+        (Side::Client, client_request),
+        (Side::Server, server_request),
+    ] {
+        for (url, enabled) in modules {
+            let entity = Entity::new()
+                .with(self::is_module(), ())
+                .with(self::bytecode_from_url(), url.to_string())
+                .with(self::module_enabled(), enabled)
+                .with(self::package_ref(), package_id);
+
+            let is_server = target == Side::Server;
+            let entity = if is_server {
+                entity.with(is_module_on_server(), ())
             } else {
-                Identifier::new(format!("{}_{}", manifest.project.id, filename_identifier)).map_err(anyhow::Error::msg)?
+                entity
             };
 
-            let description = manifest.project.description.clone().unwrap_or_default();
-            let description = if is_sole_module { description } else { format!("{description} ({filename_identifier})") };
-
-            let id = spawn_module(world, &name, description, true)?;
-
-            if target == "client" {
-                let relative_path = path.strip_prefix(&build_dir)?;
-
-                let base_url = ServerBaseUrlKey.get(world.resource(asset_cache()));
-                let bytecode_url = AssetUrl::parse(&relative_path.to_string_lossy())?.resolve(&base_url)?.to_string();
-
-                world.add_component(id, client_bytecode_from_url(), bytecode_url)?;
+            let id = entity.spawn(world);
+            if is_server {
+                server_modules.push(id);
             } else {
-                let bytecode = std::fs::read(path)?;
-                world.add_component(id, module_bytecode(), ModuleBytecode(bytecode))?;
+                client_modules.push(id);
             }
         }
     }
 
-    Ok(())
+    Ok(WasmSpawnResponse {
+        client_modules,
+        server_modules,
+    })
 }

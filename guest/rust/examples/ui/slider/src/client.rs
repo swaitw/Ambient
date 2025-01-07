@@ -1,20 +1,19 @@
-use ambient_api::prelude::*;
-use ambient_element::{element_component, Element, ElementComponentExt, Hooks};
-use ambient_guest_bridge::components::layout::space_between_items;
-use ambient_ui_components::{
-    default_theme::STREET,
-    editor::{IntegerSlider, Slider},
-    layout::FlowColumn,
-    setup_ui_camera, FocusRoot, UIExt,
-};
+use ambient_api::{core::layout::components::space_between_items, element::use_state, prelude::*};
+
+pub mod packages;
+
+#[main]
+pub fn main() {
+    App.el().spawn_interactive();
+}
 
 #[element_component]
 fn App(hooks: &mut Hooks) -> Element {
-    let (f32_value, set_f32_value) = hooks.use_state(0.);
-    let (f32_exp_value, set_f32_exp_value) = hooks.use_state(0.1);
-    let (i32_value, set_i32_value) = hooks.use_state(0);
+    let (f32_value, set_f32_value) = use_state(hooks, 0.);
+    let (f32_exp_value, set_f32_exp_value) = use_state(hooks, 0.1);
+    let (i32_value, set_i32_value) = use_state(hooks, 0);
 
-    FocusRoot::el([FlowColumn::el([
+    FlowColumn::el([
         Slider {
             value: f32_value,
             on_change: Some(set_f32_value),
@@ -47,15 +46,7 @@ fn App(hooks: &mut Hooks) -> Element {
             suffix: None,
         }
         .el(),
-    ])])
-    .set(space_between_items(), STREET)
+    ])
+    .with(space_between_items(), STREET)
     .with_padding_even(STREET)
-}
-
-#[main]
-pub async fn main() -> EventResult {
-    setup_ui_camera();
-    App.el().spawn_interactive();
-
-    EventOk
 }

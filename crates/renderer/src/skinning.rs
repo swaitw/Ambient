@@ -4,35 +4,27 @@ use std::sync::{
 };
 
 use ambient_core::{
-    asset_cache, gpu_components,
-    gpu_ecs::{GpuComponentFormat, GpuWorldSyncEvent, MappedComponentToGpuSystem},
+    asset_cache, gpu,
     transform::{inv_local_to_world, local_to_world},
 };
-use ambient_ecs::{components, query, Commands, Debuggable, Description, EntityId, Name, Networked, Store, SystemGroup};
+use ambient_ecs::{components, query, Commands, Networked, Store, SystemGroup};
 use ambient_gpu::{
     gpu::{Gpu, GpuKey},
     typed_buffer::TypedBuffer,
 };
-use ambient_std::asset_cache::{AssetCache, SyncAssetKey, SyncAssetKeyExt};
+use ambient_gpu_ecs::{
+    gpu_components, GpuComponentFormat, GpuWorldSyncEvent, MappedComponentToGpuSystem,
+};
+use ambient_native_std::asset_cache::{AssetCache, SyncAssetKey, SyncAssetKeyExt};
 use glam::{vec4, Mat4};
 use itertools::Itertools;
 use parking_lot::Mutex;
 
+pub use ambient_ecs::generated::rendering::components::{joint_matrices, joints};
+
 components!("rendering", {
     @[Networked, Store]
     inverse_bind_matrices: Arc<Vec<glam::Mat4>>,
-    @[
-        Networked, Store, Debuggable,
-        Name["Joints"],
-        Description["Contains the joints that comprise this skinned mesh."]
-    ]
-    joints: Vec<EntityId>,
-    @[
-        Networked, Store, Debuggable,
-        Name["Joint Matrices"],
-        Description["Contains the matrices for each joint of this skinned mesh.\nThis should be used in combination with `joints`."]
-    ]
-    joint_matrices: Vec<glam::Mat4>,
 
     skin: Skin,
 
@@ -59,7 +51,7 @@ pub struct SkinsBufferKey;
 impl SyncAssetKey<Arc<Mutex<SkinsBuffer>>> for SkinsBufferKey {
     fn load(&self, assets: AssetCache) -> Arc<Mutex<SkinsBuffer>> {
         let gpu = GpuKey.get(&assets);
-        Arc::new(Mutex::new(SkinsBuffer::new(gpu)))
+        Arc::new(Mutex::new(SkinsBuffer::new(&gpu)))
     }
 }
 
@@ -69,45 +61,59 @@ pub struct SkinsBuffer {
     pub buffer: TypedBuffer<Mat4>,
 }
 impl SkinsBuffer {
-    fn new(gpu: Arc<Gpu>) -> Self {
+    fn new(gpu: &Gpu) -> Self {
         Self {
             buffer: TypedBuffer::new(
                 gpu,
-                "SkinsBuffer.buffer",
+                Some("SkinsBuffer.buffer"),
                 1,
-                1,
-                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+                wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_SRC
+                    | wgpu::BufferUsages::COPY_DST,
             ),
         }
     }
-    pub fn create(&mut self, size: u32) -> Skin {
+    pub fn create(&mut self, gpu: &Gpu, size: u32) -> Skin {
         let skin = Skin(Arc::new(AtomicU32::new(self.buffer.len() as u32)));
-        self.buffer.resize(self.buffer.len() + size as u64, true);
+        self.buffer.set_len(gpu, self.buffer.len() + size as usize);
         skin
     }
-    pub fn update(&self, skin: &Skin, joint_matrices: &[Mat4]) {
-        self.buffer.write(skin.get_offset() as u64, joint_matrices);
+    pub fn update(&self, gpu: &Gpu, skin: &Skin, joint_matrices: &[Mat4]) {
+        self.buffer
+            .write(gpu, skin.get_offset() as usize, joint_matrices);
     }
 }
 
 pub fn skinning_systems() -> SystemGroup {
     SystemGroup::new(
         "skinning_systems",
-        vec![query((inv_local_to_world(), inverse_bind_matrices(), joints(), skin())).to_system(|q, world, qs, _| {
-            let skins_h = SkinsBufferKey.get(world.resource(asset_cache()));
+        vec![query((
+            inv_local_to_world(),
+            inverse_bind_matrices(),
+            joints(),
+            skin(),
+        ))
+        .to_system(|q, world, qs, _| {
+            let assets = world.resource(asset_cache());
+            let gpu = world.resource(gpu());
+            let skins_h = SkinsBufferKey.get(assets);
             let skins = skins_h.lock();
             let mut commands = Commands::new();
-            for (id, (&inv_local_to_world, inverse_bind_matrices, joints, skin)) in q.iter(world, qs) {
+            for (id, (&inv_local_to_world, inverse_bind_matrices, joints, skin)) in
+                q.iter(world, qs)
+            {
                 let joint_matrices = joints
                     .iter()
                     .enumerate()
                     .map(|(i, joint)| {
                         inv_local_to_world
                             * world.get(*joint, local_to_world()).unwrap()
-                            * *inverse_bind_matrices.get(i).unwrap_or(&glam::Mat4::IDENTITY)
+                            * *inverse_bind_matrices
+                                .get(i)
+                                .unwrap_or(&glam::Mat4::IDENTITY)
                     })
                     .collect_vec();
-                skins.update(skin, &joint_matrices);
+                skins.update(gpu, skin, &joint_matrices);
                 commands.set(id, self::joint_matrices(), joint_matrices);
             }
             commands.apply(world).unwrap();
@@ -115,10 +121,11 @@ pub fn skinning_systems() -> SystemGroup {
     )
 }
 
-pub fn gpu_world_systems() -> SystemGroup<GpuWorldSyncEvent> {
+pub fn gpu_world_systems(gpu: Arc<Gpu>) -> SystemGroup<GpuWorldSyncEvent> {
     SystemGroup::new(
         "skinning/gpu_world",
         vec![Box::new(MappedComponentToGpuSystem::new(
+            gpu,
             GpuComponentFormat::Vec4,
             skin(),
             gpu_components::skin(),

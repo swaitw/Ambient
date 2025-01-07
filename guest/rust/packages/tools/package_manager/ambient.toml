@@ -1,0 +1,59 @@
+[package]
+id = "hr4pxz7kfhzgimicoyh65ydel3aehuhk"
+name = "Package Manager"
+description = "A package manager/mod manager for your game. Use `mod_manager_for` to turn it into a mod manager."
+version = "0.3.2-nightly-2024-01-11"
+content = { type = "Tool" }
+ambient_version = "0.3.2-nightly-2024-01-11"
+
+[components.mod_manager_for]
+name = "Mod Manager For"
+description = "Package config component. Attach this component to this package's entity to make it a mod manager for the given package."
+type = "EntityId"
+attributes = ["Networked", "Debuggable"]
+
+[messages.PackageLoad.fields]
+url = "String"
+enabled = "Bool"
+
+[messages.PackageLoadSuccess.fields]
+id = "EntityId"
+name = "String"
+
+[messages.PackageLoadFailure.fields]
+reason = "String"
+
+[messages.PackageSetEnabled.fields]
+id = "EntityId"
+enabled = "Bool"
+
+[messages.WasmSetEnabled.fields]
+id = "EntityId"
+enabled = "Bool"
+
+[messages.WasmReload.fields]
+id = "EntityId"
+
+[messages.PackageShow]
+description = "Shows the package view for a package"
+[messages.PackageShow.fields]
+id = "EntityId"
+
+[messages.PackageLoadShow]
+description = "Shows the package load view"
+[messages.PackageLoadShow.fields]
+
+[messages.PackageRemoteRequest]
+description = "Requests all relevant remote packages"
+[messages.PackageRemoteRequest.fields]
+
+[messages.PackageRemoteResponse]
+description = "Response to a remote package request"
+[messages.PackageRemoteResponse.fields]
+# It would be nice to send structured types here
+# https://github.com/AmbientRun/Ambient/issues/790
+packages = { container_type = "Vec", element_type = "String" }
+error = { container_type = "Option", element_type = "String" }
+
+[dependencies]
+editor_schema = { path = "../../schemas/editor", id = "n7xfnlfzdmnvj7bqasfdhqftbtdi27ah", version = "0.3.2-nightly-2024-01-11" }

@@ -1,0 +1,101 @@
+[package]
+id = "d3y3wbexrclipsykysumem3fthkudwx2"
+name = "Character Animation"
+description = "Implements basic character animations for a unit."
+version = "0.3.2-nightly-2024-01-11"
+content = { type = "Asset", animations = true, code = true }
+ambient_version = "0.3.2-nightly-2024-01-11"
+
+[dependencies]
+game_object = { path = "../../schemas/game_object", id = "hvxms7i2px7krvkm23sxfjxsjqlcmtb5", version = "0.3.2-nightly-2024-01-11" }
+unit_schema = { path = "../../schemas/unit", id = "afl5yv5ya35vbuaj3aido22cwjzat25z", version = "0.3.2-nightly-2024-01-11" }
+
+[components]
+basic_character_animations = { type = "EntityId", description = "Apply animations to the model this points to. Parameters such as health etc. is read from the entity this component is attached to.", attributes = [
+    "Debuggable",
+    "Networked",
+] }
+use_rifle_animations = { type = "Empty", description = "Use rifle animations instead of no-weapon animations", attributes = [
+    "Debuggable",
+    "Networked",
+] }
+
+# Overrides for the default animations
+walk_forward = { type = "String", description = "URL to animation", attributes = [
+    "Debuggable",
+    "Networked",
+] }
+walk_backward = { type = "String", description = "URL to animation", attributes = [
+    "Debuggable",
+    "Networked",
+] }
+walk_left = { type = "String", description = "URL to animation", attributes = [
+    "Debuggable",
+    "Networked",
+] }
+walk_right = { type = "String", description = "URL to animation", attributes = [
+    "Debuggable",
+    "Networked",
+] }
+walk_forward_left = { type = "String", description = "URL to animation", attributes = [
+    "Debuggable",
+    "Networked",
+] }
+walk_forward_right = { type = "String", description = "URL to animation", attributes = [
+    "Debuggable",
+    "Networked",
+] }
+walk_backward_left = { type = "String", description = "URL to animation", attributes = [
+    "Debuggable",
+    "Networked",
+] }
+walk_backward_right = { type = "String", description = "URL to animation", attributes = [
+    "Debuggable",
+    "Networked",
+] }
+
+run_forward = { type = "String", description = "URL to animation", attributes = [
+    "Debuggable",
+    "Networked",
+] }
+run_backward = { type = "String", description = "URL to animation", attributes = [
+    "Debuggable",
+    "Networked",
+] }
+run_left = { type = "String", description = "URL to animation", attributes = [
+    "Debuggable",
+    "Networked",
+] }
+run_right = { type = "String", description = "URL to animation", attributes = [
+    "Debuggable",
+    "Networked",
+] }
+run_forward_left = { type = "String", description = "URL to animation", attributes = [
+    "Debuggable",
+    "Networked",
+] }
+run_forward_right = { type = "String", description = "URL to animation", attributes = [
+    "Debuggable",
+    "Networked",
+] }
+run_backward_left = { type = "String", description = "URL to animation", attributes = [
+    "Debuggable",
+    "Networked",
+] }
+run_backward_right = { type = "String", description = "URL to animation", attributes = [
+    "Debuggable",
+    "Networked",
+] }
+
+idle = { type = "String", description = "URL to animation", attributes = [
+    "Debuggable",
+    "Networked",
+] }
+death = { type = "String", description = "URL to animation", attributes = [
+    "Debuggable",
+    "Networked",
+] }
+jump = { type = "String", description = "URL to animation", attributes = [
+    "Debuggable",
+    "Networked",
+] }

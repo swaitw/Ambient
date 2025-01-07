@@ -1,4 +1,4 @@
-use std::fmt::Display;
+use std::borrow::Cow;
 
 use itertools::Itertools;
 
@@ -12,7 +12,10 @@ pub struct ArchetypeFilter {
 
 impl ArchetypeFilter {
     pub fn new() -> Self {
-        Self { components: ComponentSet::new(), not_components: ComponentSet::new() }
+        Self {
+            components: ComponentSet::new(),
+            not_components: ComponentSet::new(),
+        }
     }
 
     pub fn incl_ref(mut self, component: impl Into<ComponentDesc>) -> Self {
@@ -38,7 +41,10 @@ impl ArchetypeFilter {
     }
     pub fn matches_entity(&self, world: &World, id: EntityId) -> bool {
         if let Some(loc) = world.locs.get(&id) {
-            let arch = world.archetypes.get(loc.archetype).expect("Archetype doesn't exist");
+            let arch = world
+                .archetypes
+                .get(loc.archetype)
+                .expect("Archetype doesn't exist");
             self.matches(&arch.active_components)
         } else {
             false
@@ -50,13 +56,21 @@ impl ArchetypeFilter {
     pub fn iter_archetypes<'a>(&self, world: &'a World) -> impl Iterator<Item = &'a Archetype> {
         self.iter_by_archetypes(&world.archetypes)
     }
-    fn iter_by_archetypes<'a>(&self, archetypes: &'a [Archetype]) -> impl Iterator<Item = &'a Archetype> {
+    fn iter_by_archetypes<'a>(
+        &self,
+        archetypes: &'a [Archetype],
+    ) -> impl Iterator<Item = &'a Archetype> {
         let f = self.clone();
-        archetypes.iter().filter(move |arch| f.matches(&arch.active_components))
+        archetypes
+            .iter()
+            .filter(move |arch| f.matches(&arch.active_components))
     }
     pub fn iter_entities<'a>(&self, world: &'a World) -> impl Iterator<Item = EntityAccessor> + 'a {
-        self.iter_by_archetypes(&world.archetypes)
-            .flat_map(|arch| arch.entity_indices_to_ids.iter().map(move |&id| EntityAccessor::World { id }))
+        self.iter_by_archetypes(&world.archetypes).flat_map(|arch| {
+            arch.entity_indices_to_ids
+                .iter()
+                .map(move |&id| EntityAccessor::World { id })
+        })
     }
 }
 impl Default for ArchetypeFilter {
@@ -154,13 +168,15 @@ pub struct ChangedQuery<T: 'static> {
 
 impl<T> Clone for ChangedQuery<T> {
     fn clone(&self) -> Self {
-        Self { component: self.component }
+        *self
     }
 }
 
 impl<T> Debug for ChangedQuery<T> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ChangedQuery").field("component", &self.component).finish()
+        f.debug_struct("ChangedQuery")
+            .field("component", &self.component)
+            .finish()
     }
 }
 
@@ -239,38 +255,76 @@ impl<T: ComponentValue> ComponentsTupleAppend<T> for () {
 }
 
 #[derive(Debug, Clone)]
+struct ArchetypesQueryState {
+    archetypes: Vec<usize>,
+    archetype_index: usize,
+}
+impl ArchetypesQueryState {
+    fn new() -> Self {
+        Self {
+            archetypes: Vec::new(),
+            archetype_index: 0,
+        }
+    }
+    fn update_archetypes(&mut self, world: &World, filter: &ArchetypeFilter) {
+        for i in self.archetype_index..world.archetypes.len() {
+            if filter.matches(&world.archetypes[i].active_components) {
+                self.archetypes.push(i);
+            }
+        }
+        self.archetype_index = world.archetypes.len();
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct ChangeReaders(SparseVec<SparseVec<FramedEventsReader<EntityId>>>);
+impl ChangeReaders {
+    pub(super) fn get(&mut self, arch: usize, comp: usize) -> &mut FramedEventsReader<EntityId> {
+        let a = self.0.get_mut_or_insert_with(arch, SparseVec::new);
+        a.get_mut_or_insert_with(comp, FramedEventsReader::new)
+    }
+}
+#[derive(Debug, Clone)]
+struct MoveinReaders(SparseVec<FramedEventsReader<EntityId>>);
+impl MoveinReaders {
+    pub(super) fn get(&mut self, arch: usize) -> &mut FramedEventsReader<EntityId> {
+        self.0.get_mut_or_insert_with(arch, FramedEventsReader::new)
+    }
+}
+#[derive(Debug, Clone)]
+struct MoveoutReaders(SparseVec<FramedEventsReader<(EntityId, Entity)>>);
+impl MoveoutReaders {
+    pub(super) fn get(&mut self, arch: usize) -> &mut FramedEventsReader<(EntityId, Entity)> {
+        self.0.get_mut_or_insert_with(arch, FramedEventsReader::new)
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct QueryState {
     inited: bool,
-    change_readers: SparseVec<SparseVec<FramedEventsReader<EntityId>>>,
-    movein_readers: SparseVec<FramedEventsReader<EntityId>>,
-    moveout_readers: SparseVec<FramedEventsReader<(EntityId, Entity)>>,
+    pub(super) change_readers: ChangeReaders,
+    movein_readers: MoveinReaders,
+    moveout_readers: MoveoutReaders,
     ticker: u64,
     entered: HashSet<EntityId>,
     world_version: u64,
     entities: Vec<EntityAccessor>,
+
+    archetypes: ArchetypesQueryState,
 }
 impl QueryState {
     pub fn new() -> Self {
         Self {
             inited: false,
-            change_readers: SparseVec::new(),
-            movein_readers: SparseVec::new(),
-            moveout_readers: SparseVec::new(),
+            change_readers: ChangeReaders(SparseVec::new()),
+            movein_readers: MoveinReaders(SparseVec::new()),
+            moveout_readers: MoveoutReaders(SparseVec::new()),
             ticker: 0,
             entered: Default::default(),
             world_version: 0,
             entities: Vec::new(),
+            archetypes: ArchetypesQueryState::new(),
         }
-    }
-    pub(super) fn get_change_reader(&mut self, arch: usize, comp: usize) -> &mut FramedEventsReader<EntityId> {
-        let a = self.change_readers.get_mut_or_insert_with(arch, SparseVec::new);
-        a.get_mut_or_insert_with(comp, FramedEventsReader::new)
-    }
-    pub(super) fn get_movein_reader(&mut self, arch: usize) -> &mut FramedEventsReader<EntityId> {
-        self.movein_readers.get_mut_or_insert_with(arch, FramedEventsReader::new)
-    }
-    pub(super) fn get_moveout_reader(&mut self, arch: usize) -> &mut FramedEventsReader<(EntityId, Entity)> {
-        self.moveout_readers.get_mut_or_insert_with(arch, FramedEventsReader::new)
     }
     pub(super) fn prepare_for_query(&mut self, world: &World) {
         self.ticker = world.query_ticker.0.fetch_add(1, Ordering::SeqCst) + 1;
@@ -304,7 +358,10 @@ pub struct Query {
 
 impl Query {
     pub fn new(filter: ArchetypeFilter) -> Self {
-        Self { filter, event: QueryEvent::Frame }
+        Self {
+            filter,
+            event: QueryEvent::Frame,
+        }
     }
 
     pub fn all() -> Self {
@@ -319,10 +376,22 @@ impl Query {
         q
     }
 
-    fn new_for_typed_query(component_ids: ComponentSet, changed_components: Vec<ComponentDesc>) -> Self {
+    fn new_for_typed_query(
+        component_ids: ComponentSet,
+        changed_components: Vec<ComponentDesc>,
+    ) -> Self {
         Query {
-            filter: ArchetypeFilter { components: component_ids, not_components: ComponentSet::new() },
-            event: if !changed_components.is_empty() { QueryEvent::Changed { components: changed_components } } else { QueryEvent::Frame },
+            filter: ArchetypeFilter {
+                components: component_ids,
+                not_components: ComponentSet::new(),
+            },
+            event: if !changed_components.is_empty() {
+                QueryEvent::Changed {
+                    components: changed_components,
+                }
+            } else {
+                QueryEvent::Frame
+            },
         }
     }
 
@@ -330,7 +399,9 @@ impl Query {
         if let QueryEvent::Changed { components } = &mut self.event {
             components.push(component.into());
         } else {
-            self.event = QueryEvent::Changed { components: vec![component.into()] };
+            self.event = QueryEvent::Changed {
+                components: vec![component.into()],
+            };
         }
         self
     }
@@ -355,7 +426,9 @@ impl Query {
     pub fn optional_changed_ref(mut self, component: impl Into<ComponentDesc>) -> Self {
         let event = std::mem::replace(&mut self.event, QueryEvent::Frame);
         self.event = match event {
-            QueryEvent::Frame => QueryEvent::Changed { components: vec![component.into()] },
+            QueryEvent::Frame => QueryEvent::Changed {
+                components: vec![component.into()],
+            },
             QueryEvent::Changed { mut components } => {
                 components.push(component.into());
                 QueryEvent::Changed { components }
@@ -380,26 +453,38 @@ impl Query {
     }
     pub fn filter(mut self, filter: &ArchetypeFilter) -> Self {
         self.filter.components.union_with(&filter.components);
-        self.filter.not_components.union_with(&filter.not_components);
+        self.filter
+            .not_components
+            .union_with(&filter.not_components);
         self
     }
     fn get_changed(&self, world: &World, state: &mut QueryState, components: &Vec<ComponentDesc>) {
         if !state.inited && !world.ignore_query_inits {
-            for arch in self.filter.iter_by_archetypes(&world.archetypes) {
+            for arch in state
+                .archetypes
+                .archetypes
+                .iter()
+                .map(|i| &world.archetypes[*i])
+            {
                 for comp in components {
                     if let Some(arch_comp) = arch.components.get(comp.index() as _) {
                         let events = &*arch_comp.changes.borrow();
-                        let read = state.get_change_reader(arch.id, comp.index() as _);
+                        let read = state.change_readers.get(arch.id, comp.index() as _);
                         read.move_to_end(events);
                     }
                 }
             }
             return;
         }
-        for arch in self.filter.iter_by_archetypes(&world.archetypes) {
+        for arch in state
+            .archetypes
+            .archetypes
+            .iter()
+            .map(|i| &world.archetypes[*i])
+        {
             for comp in components {
                 if let Some(arch_comp) = arch.components.get(comp.index() as _) {
-                    let read = state.get_change_reader(arch.id, comp.index() as _);
+                    let read = state.change_readers.get(arch.id, comp.index() as _);
                     let events = &*arch_comp.changes.borrow();
                     for (_, &entity_id) in read.iter(events) {
                         if let Some(loc) = world.locs.get(&entity_id) {
@@ -425,19 +510,25 @@ impl Query {
             return;
         }
         state.entities.clear();
-        for arch in self.filter.iter_by_archetypes(&world.archetypes) {
-            let read = state.get_movein_reader(arch.id);
+        for arch in state
+            .archetypes
+            .archetypes
+            .iter()
+            .map(|i| &world.archetypes[*i])
+        {
+            let read = state.movein_readers.get(arch.id);
             for (_, id) in read.iter(&arch.movein_events) {
                 if let Some(loc) = world.locs.get(id) {
                     if loc.archetype == arch.id && state.entered.insert(*id) {
-                        let process = world.archetypes[loc.archetype].query_mark(loc.index, state.ticker);
+                        let process =
+                            world.archetypes[loc.archetype].query_mark(loc.index, state.ticker);
                         if process {
                             state.entities.push(EntityAccessor::World { id: *id });
                         }
                     }
                 }
             }
-            let read = state.get_moveout_reader(arch.id);
+            let read = state.moveout_readers.get(arch.id);
             for (_, (id, _)) in read.iter(&arch.moveout_events) {
                 if !self.filter.matches_entity(world, *id) {
                     state.entered.remove(id);
@@ -451,17 +542,27 @@ impl Query {
         }
 
         state.entities.clear();
-        for arch in self.filter.iter_by_archetypes(&world.archetypes) {
-            let read = state.get_moveout_reader(arch.id);
+        for arch in state
+            .archetypes
+            .archetypes
+            .iter()
+            .map(|i| &world.archetypes[*i])
+        {
+            let read = state.moveout_readers.get(arch.id);
             for (event_id, (id, _)) in read.iter(&arch.moveout_events) {
                 let next_matched = if let Some(loc) = world.locs.get(id) {
-                    self.filter.matches(&world.archetypes[loc.archetype].active_components)
+                    self.filter
+                        .matches(&world.archetypes[loc.archetype].active_components)
                 } else {
                     false
                 };
 
                 if !next_matched {
-                    state.entities.push(EntityAccessor::Despawned { id: *id, archetype: arch.id, event_id });
+                    state.entities.push(EntityAccessor::Despawned {
+                        id: *id,
+                        archetype: arch.id,
+                        event_id,
+                    });
                 }
             }
         }
@@ -470,17 +571,38 @@ impl Query {
         if state.inited || world.ignore_query_inits {
             return false;
         }
-        for arch in self.filter.iter_by_archetypes(&world.archetypes) {
-            let read_in = state.get_movein_reader(arch.id);
+        for arch in state
+            .archetypes
+            .archetypes
+            .iter()
+            .map(|i| &world.archetypes[*i])
+        {
+            let read_in = state.movein_readers.get(arch.id);
             read_in.move_to_end(&arch.movein_events);
-            let read_out = state.get_moveout_reader(arch.id);
+            let read_out = state.moveout_readers.get(arch.id);
             read_out.move_to_end(&arch.moveout_events);
         }
         true
     }
-    pub fn iter<'a>(&self, world: &'a World, state: Option<&'a mut QueryState>) -> Box<dyn Iterator<Item = EntityAccessor> + 'a> {
+    pub fn iter<'a>(
+        &self,
+        world: &'a World,
+        mut state: Option<&'a mut QueryState>,
+    ) -> Box<dyn Iterator<Item = EntityAccessor> + 'a> {
+        if let Some(state) = &mut state {
+            state.archetypes.update_archetypes(world, &self.filter);
+        }
         if let QueryEvent::Frame = &self.event {
-            return Box::new(self.filter.iter_entities(world));
+            if let Some(state) = state {
+                return Box::new(state.archetypes.archetypes.iter().flat_map(|i| {
+                    world.archetypes[*i]
+                        .entity_indices_to_ids
+                        .iter()
+                        .map(move |&id| EntityAccessor::World { id })
+                }));
+            } else {
+                return Box::new(self.filter.iter_entities(world));
+            }
         }
 
         let state = state.expect("Spawn/despawn/change queries must have a query state");
@@ -500,19 +622,36 @@ impl Query {
         state.world_version = world.version();
         Box::new(state.entities.iter().copied())
     }
-    pub fn to_system<F: Fn(&Self, &mut World, &mut QueryState, &E) + Send + Sync + 'static, E: 'static>(
+    pub fn to_system<
+        F: Fn(&Self, &mut World, &mut QueryState, &E) + Send + Sync + 'static,
+        E: 'static,
+    >(
         self,
+        update: F,
+    ) -> Box<dyn System<E> + Sync + Send> {
+        self.to_system_with_name("Unknown system", update)
+    }
+    pub fn to_system_with_name<
+        F: Fn(&Self, &mut World, &mut QueryState, &E) + Send + Sync + 'static,
+        E: 'static,
+    >(
+        self,
+        name: &'static str,
         update: F,
     ) -> Box<dyn System<E> + Sync + Send> {
         let mut state = QueryState::new();
         Box::new(FnSystem(Box::new(move |world, event| {
+            profiling::scope!(name);
             update(&self, world, &mut state, event);
         })))
     }
 
     pub fn with_commands<F, E>(self, update: F) -> Box<dyn System<E>>
     where
-        F: Fn(&Self, &mut World, Option<&mut QueryState>, &E, &mut Commands) + Send + Sync + 'static,
+        F: Fn(&Self, &mut World, Option<&mut QueryState>, &E, &mut Commands)
+            + Send
+            + Sync
+            + 'static,
         E: 'static,
     {
         let mut state = QueryState::new();
@@ -534,8 +673,14 @@ impl Query {
 
 #[derive(Debug, Clone, Copy)]
 pub enum EntityAccessor {
-    World { id: EntityId },
-    Despawned { id: EntityId, archetype: usize, event_id: DBEventId },
+    World {
+        id: EntityId,
+    },
+    Despawned {
+        id: EntityId,
+        archetype: usize,
+        event_id: DBEventId,
+    },
 }
 impl EntityAccessor {
     pub fn id(&self) -> EntityId {
@@ -544,15 +689,38 @@ impl EntityAccessor {
             Self::Despawned { id, .. } => *id,
         }
     }
-    pub fn get<'a, T: ComponentValue>(&self, world: &'a World, component: Component<T>) -> &'a T {
+    pub fn get_optional<'a, T: ComponentValue>(
+        &self,
+        world: &'a World,
+        component: Component<T>,
+    ) -> Option<&'a T> {
         match self {
-            Self::World { id } => world.get_ref(*id, component).unwrap(),
-            Self::Despawned { archetype, event_id, .. } => {
-                world.archetypes[*archetype].moveout_events.get(*event_id).unwrap().1.get_ref(component).unwrap()
-            }
+            Self::World { id } => world.get_ref(*id, component).ok(),
+            Self::Despawned {
+                archetype,
+                event_id,
+                ..
+            } => world.archetypes[*archetype]
+                .moveout_events
+                .get(*event_id)?
+                .1
+                .get_ref(component),
         }
     }
-    pub fn get_mut<'a, T: ComponentValue>(&self, world: &'a World, component: Component<T>) -> &'a mut T {
+    pub fn get<'a, T: ComponentValue>(&self, world: &'a World, component: Component<T>) -> &'a T {
+        self.get_optional(world, component).unwrap_or_else(|| {
+            panic!(
+                "Entity {} doesn't have component {:?}",
+                self.id(),
+                component
+            )
+        })
+    }
+    pub fn get_mut<'a, T: ComponentValue>(
+        &self,
+        world: &'a World,
+        component: Component<T>,
+    ) -> &'a mut T {
         match self {
             Self::World { id } => world.get_mut_unsafe(*id, component).unwrap(),
             Self::Despawned { .. } => panic!("Can't mutate despawned entities"),
@@ -563,7 +731,11 @@ impl EntityAccessor {
 pub fn query<'a, R: ComponentQuery<'a> + Clone + 'static>(read_components: R) -> TypedReadQuery<R> {
     TypedReadQuery::new(read_components)
 }
-pub fn query_mut<'a, RW: ComponentQuery<'a> + Clone + 'static, R: ComponentQuery<'a> + Clone + 'static>(
+pub fn query_mut<
+    'a,
+    RW: ComponentQuery<'a> + Clone + 'static,
+    R: ComponentQuery<'a> + Clone + 'static,
+>(
     read_write_components: RW,
     read_components: R,
 ) -> TypedReadWriteQuery<RW, R> {
@@ -581,7 +753,9 @@ where
     R: Debug,
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("TypedReadQuery").field("read_components", &self.read_components).finish_non_exhaustive()
+        f.debug_struct("TypedReadQuery")
+            .field("read_components", &self.read_components)
+            .finish_non_exhaustive()
     }
 }
 
@@ -591,9 +765,15 @@ impl<'a, R: ComponentQuery<'a> + Clone + 'static> TypedReadQuery<R> {
         read_components.write_component_ids(&mut component_ids);
         let mut changed_components = Vec::new();
         read_components.get_change_filtered(&mut changed_components);
-        Self { query: Query::new_for_typed_query(component_ids, changed_components), read_components }
+        Self {
+            query: Query::new_for_typed_query(component_ids, changed_components),
+            read_components,
+        }
     }
-    pub fn read<T: ComponentValue>(&self, component: Component<T>) -> TypedReadQuery<<R as ComponentsTupleAppend<T>>::Output>
+    pub fn read<T: ComponentValue>(
+        &self,
+        component: Component<T>,
+    ) -> TypedReadQuery<<R as ComponentsTupleAppend<T>>::Output>
     where
         R: ComponentsTupleAppend<T>,
         <R as ComponentsTupleAppend<T>>::Output: ComponentQuery<'a> + Clone + 'static,
@@ -634,7 +814,9 @@ impl<'a, R: ComponentQuery<'a> + Clone + 'static> TypedReadQuery<R> {
         state: Option<&'a mut QueryState>,
     ) -> impl Iterator<Item = (EntityId, <R as ComponentQuery<'a>>::Data)> + 'a {
         let r = self.read_components.clone();
-        self.query.iter(world, state).map(move |acc| (acc.id(), r.get_data(world, &acc)))
+        self.query
+            .iter(world, state)
+            .map(move |acc| (acc.id(), r.get_data(world, &acc)))
     }
     pub fn iter_cloned(
         &self,
@@ -642,10 +824,19 @@ impl<'a, R: ComponentQuery<'a> + Clone + 'static> TypedReadQuery<R> {
         state: Option<&'a mut QueryState>,
     ) -> impl Iterator<Item = (EntityId, <R as ComponentQuery<'a>>::DataCloned)> + 'a {
         let r = self.read_components.clone();
-        self.query.iter(world, state).map(move |acc| (acc.id(), r.get_data_cloned(world, &acc)))
+        self.query
+            .iter(world, state)
+            .map(move |acc| (acc.id(), r.get_data_cloned(world, &acc)))
     }
-    pub fn collect_ids(&self, world: &'a World, state: Option<&'a mut QueryState>) -> Vec<EntityId> {
-        self.query.iter(world, state).map(move |acc| acc.id()).collect_vec()
+    pub fn collect_ids(
+        &self,
+        world: &'a World,
+        state: Option<&'a mut QueryState>,
+    ) -> Vec<EntityId> {
+        self.query
+            .iter(world, state)
+            .map(move |acc| acc.id())
+            .collect_vec()
     }
     pub fn collect_cloned(
         &self,
@@ -663,13 +854,19 @@ impl<'a, R: ComponentQuery<'a> + Clone + 'static> TypedReadQuery<R> {
     ) -> Option<(EntityId, <R as ComponentQuery<'a>>::DataCloned)> {
         self.iter_cloned(world, state).next()
     }
-    pub fn to_system<F: FnMut(&Self, &mut World, Option<&mut QueryState>, &E) + Send + Sync + 'static, E: 'static>(
+    pub fn to_system<
+        F: FnMut(&Self, &mut World, Option<&mut QueryState>, &E) + Send + Sync + 'static,
+        E: 'static,
+    >(
         self,
         update: F,
     ) -> DynSystem<E> {
         self.to_system_with_name("Unknown System", update)
     }
-    pub fn to_system_with_name<F: FnMut(&Self, &mut World, Option<&mut QueryState>, &E) + Send + Sync + 'static, E: 'static>(
+    pub fn to_system_with_name<
+        F: FnMut(&Self, &mut World, Option<&mut QueryState>, &E) + Send + Sync + 'static,
+        E: 'static,
+    >(
         self,
         name: &'static str,
         mut update: F,
@@ -683,7 +880,10 @@ impl<'a, R: ComponentQuery<'a> + Clone + 'static> TypedReadQuery<R> {
 
     pub fn with_commands<F, E>(self, update: F) -> DynSystem<E>
     where
-        F: Fn(&Self, &mut World, Option<&mut QueryState>, &E, &mut Commands) + Send + Sync + 'static,
+        F: Fn(&Self, &mut World, Option<&mut QueryState>, &E, &mut Commands)
+            + Send
+            + Sync
+            + 'static,
         E: 'static,
     {
         let mut state = QueryState::new();
@@ -700,7 +900,9 @@ pub struct TypedReadWriteQuery<RW, R> {
     read_components: R,
     query: Query,
 }
-impl<'a, RW: ComponentQuery<'a> + Clone + 'static, R: ComponentQuery<'a> + Clone + 'static> TypedReadWriteQuery<RW, R> {
+impl<'a, RW: ComponentQuery<'a> + Clone + 'static, R: ComponentQuery<'a> + Clone + 'static>
+    TypedReadWriteQuery<RW, R>
+{
     pub fn new(read_write_components: RW, read_components: R) -> Self {
         let mut write_set = ComponentSet::new();
         let mut read_set = ComponentSet::new();
@@ -717,29 +919,48 @@ impl<'a, RW: ComponentQuery<'a> + Clone + 'static, R: ComponentQuery<'a> + Clone
         let mut changed_components = Vec::new();
         read_write_components.get_change_filtered(&mut changed_components);
         read_components.get_change_filtered(&mut changed_components);
-        Self { query: Query::new_for_typed_query(component_ids, changed_components), read_write_components, read_components }
+        Self {
+            query: Query::new_for_typed_query(component_ids, changed_components),
+            read_write_components,
+            read_components,
+        }
     }
-    pub fn read_write<T: ComponentValue>(&self, component: Component<T>) -> TypedReadWriteQuery<<RW as ComponentsTupleAppend<T>>::Output, R>
+    pub fn read_write<T: ComponentValue>(
+        &self,
+        component: Component<T>,
+    ) -> TypedReadWriteQuery<<RW as ComponentsTupleAppend<T>>::Output, R>
     where
         RW: ComponentsTupleAppend<T>,
         <RW as ComponentsTupleAppend<T>>::Output: ComponentQuery<'a> + Clone + 'static,
     {
-        let mut q = TypedReadWriteQuery::new(self.read_write_components.append(component), self.read_components.clone());
+        let mut q = TypedReadWriteQuery::new(
+            self.read_write_components.append(component),
+            self.read_components.clone(),
+        );
         q.query.add_component(&self.query, component.desc());
         q
     }
-    pub fn read<T: ComponentValue>(&self, component: Component<T>) -> TypedReadWriteQuery<RW, <R as ComponentsTupleAppend<T>>::Output>
+    pub fn read<T: ComponentValue>(
+        &self,
+        component: Component<T>,
+    ) -> TypedReadWriteQuery<RW, <R as ComponentsTupleAppend<T>>::Output>
     where
         R: ComponentsTupleAppend<T>,
         <R as ComponentsTupleAppend<T>>::Output: ComponentQuery<'a> + Clone + 'static,
     {
-        let mut q = TypedReadWriteQuery::new(self.read_write_components.clone(), self.read_components.append(component));
+        let mut q = TypedReadWriteQuery::new(
+            self.read_write_components.clone(),
+            self.read_components.append(component),
+        );
         q.query.add_component(&self.query, component.desc());
         q
     }
     pub fn filter(mut self, filter: &ArchetypeFilter) -> Self {
         self.query.filter.components.union_with(&filter.components);
-        self.query.filter.not_components.union_with(&filter.not_components);
+        self.query
+            .filter
+            .not_components
+            .union_with(&filter.not_components);
         self
     }
     pub fn incl<T: ComponentValue>(mut self, component: Component<T>) -> Self {
@@ -768,19 +989,37 @@ impl<'a, RW: ComponentQuery<'a> + Clone + 'static, R: ComponentQuery<'a> + Clone
         &self,
         world: &'a mut World,
         state: Option<&'a mut QueryState>,
-    ) -> impl Iterator<Item = (EntityId, <RW as ComponentQuery<'a>>::DataMut, <R as ComponentQuery<'a>>::Data)> + 'a {
+    ) -> impl Iterator<
+        Item = (
+            EntityId,
+            <RW as ComponentQuery<'a>>::DataMut,
+            <R as ComponentQuery<'a>>::Data,
+        ),
+    > + 'a {
         let rw = self.read_write_components.clone();
         let r = self.read_components.clone();
         let world = &*world;
-        self.query.iter(world, state).map(move |acc| (acc.id(), rw.get_data_mut(world, &acc), r.get_data(world, &acc)))
+        self.query.iter(world, state).map(move |acc| {
+            (
+                acc.id(),
+                rw.get_data_mut(world, &acc),
+                r.get_data(world, &acc),
+            )
+        })
     }
-    pub fn to_system<F: Fn(&Self, &mut World, Option<&mut QueryState>, &E) + Send + Sync + 'static, E: 'static>(
+    pub fn to_system<
+        F: Fn(&Self, &mut World, Option<&mut QueryState>, &E) + Send + Sync + 'static,
+        E: 'static,
+    >(
         self,
         update: F,
     ) -> DynSystem<E> {
         self.to_system_with_name("Default", update)
     }
-    pub fn to_system_with_name<F: Fn(&Self, &mut World, Option<&mut QueryState>, &E) + Send + Sync + 'static, E: 'static>(
+    pub fn to_system_with_name<
+        F: Fn(&Self, &mut World, Option<&mut QueryState>, &E) + Send + Sync + 'static,
+        E: 'static,
+    >(
         self,
         name: &'static str,
         update: F,
@@ -794,7 +1033,10 @@ impl<'a, RW: ComponentQuery<'a> + Clone + 'static, R: ComponentQuery<'a> + Clone
 
     pub fn with_commands<F, E>(self, update: F) -> DynSystem<E>
     where
-        F: Fn(&Self, &mut World, Option<&mut QueryState>, &E, &mut Commands) + Sync + Send + 'static,
+        F: Fn(&Self, &mut World, Option<&mut QueryState>, &E, &mut Commands)
+            + Sync
+            + Send
+            + 'static,
         E: 'static,
     {
         let mut state = QueryState::new();
@@ -833,93 +1075,34 @@ impl<E> std::fmt::Debug for FnSystem<E> {
     }
 }
 
-enum Label {
-    Static(&'static str),
-    Dynamic(String),
-}
-impl Display for Label {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Label::Static(s) => s,
-            Label::Dynamic(s) => s,
-        })
-    }
-}
-
 pub type DynSystem<E = FrameEvent> = Box<dyn System<E> + Send + Sync>;
-pub struct SystemGroup<E = FrameEvent>(Label, Vec<DynSystem<E>>);
+pub struct SystemGroup<E = FrameEvent>(Cow<'static, str>, Vec<DynSystem<E>>);
 
 impl<E> SystemGroup<E> {
     pub fn new(label: &'static str, systems: Vec<DynSystem<E>>) -> Self {
-        Self(Label::Static(label), systems)
+        Self(Cow::Borrowed(label), systems)
     }
     pub fn new_with_dynamic_label(label: String, systems: Vec<DynSystem<E>>) -> Self {
-        Self(Label::Dynamic(label), systems)
+        Self(Cow::Owned(label), systems)
     }
     pub fn add(&mut self, system: DynSystem<E>) -> &mut Self {
         self.1.push(system);
         self
     }
 }
+
 impl<E> System<E> for SystemGroup<E> {
     fn run(&mut self, world: &mut World, event: &E) {
-        let mut execute = || {
-            for system in self.1.iter_mut() {
-                // profiling::scope!("sub", format!("iteration {}", i).as_str());
-                system.run(world, event);
-            }
-        };
-        match &self.0 {
-            Label::Static(s) => {
-                profiling::scope!(s);
-                let _span = tracing::debug_span!("SystemGroup::run", label = s).entered();
-                execute();
-            }
-            Label::Dynamic(s) => {
-                profiling::scope!("Dynamic", &s);
-                let _span = tracing::debug_span!("SystemGroup::run", label = s).entered();
-
-                execute();
-            }
+        profiling::scope!("SystemGroup::run", &self.0);
+        let _span = tracing::debug_span!("SystemGroup::run", "{}", &self.0).entered();
+        for system in self.1.iter_mut() {
+            system.run(world, event);
         }
     }
 }
+
 impl<E> std::fmt::Debug for SystemGroup<E> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "SystemGroup({}, _)", self.0)
     }
-}
-
-pub fn ensure_has_component<X: ComponentValue + 'static, T: ComponentValue + Clone + 'static>(
-    if_has_component: Component<X>,
-    ensure_this_component_too: Component<T>,
-    value: T,
-) -> DynSystem {
-    query(if_has_component).excl(ensure_this_component_too).to_system(move |q, world, qs, _| {
-        for (id, _) in q.collect_cloned(world, qs) {
-            world.add_component(id, ensure_this_component_too, value.clone()).unwrap();
-        }
-    })
-}
-
-pub fn ensure_has_component_with_default<X: ComponentValue + 'static, T: ComponentValue + Default + Clone + 'static>(
-    if_has_component: Component<X>,
-    ensure_this_component_too: Component<T>,
-) -> DynSystem {
-    ensure_has_component(if_has_component, ensure_this_component_too, T::default())
-}
-
-/// Uses the MakeDefault attribute. Will panic if this attribute is not present.
-pub fn ensure_has_component_with_make_default<X: ComponentValue + 'static, T: ComponentValue + Clone + 'static>(
-    if_has_component: Component<X>,
-    ensure_this_component_too: Component<T>,
-) -> DynSystem {
-    let default =
-        Entity::from_iter([ensure_this_component_too.attribute::<MakeDefault>().unwrap().make_default(ensure_this_component_too.desc())]);
-
-    query(if_has_component).excl(ensure_this_component_too).to_system(move |q, world, qs, _| {
-        for (id, _) in q.collect_cloned(world, qs) {
-            world.add_components(id, default.clone()).unwrap();
-        }
-    })
 }

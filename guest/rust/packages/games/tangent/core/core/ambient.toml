@@ -1,0 +1,39 @@
+[package]
+id = "itzh3wovmdje4ttrmo6wrravaaxp6b52"
+name = "Tangent Core"
+description = "The core of Tangent. The connective glue between all the other packages. (Will likely be split up.)"
+version = "0.3.2-nightly-2024-01-11"
+content = { type = "Asset", code = true }
+authors = ["philpax"]
+ambient_version = "0.3.2-nightly-2024-01-11"
+
+[dependencies]
+tangent_schema = { path = "../../schema", id = "mwrcsok65na7owrbdococ5sthr3ccskc", version = "0.3.2-nightly-2024-01-11" }
+
+game_object = { path = "../../../../schemas/game_object", id = "hvxms7i2px7krvkm23sxfjxsjqlcmtb5", version = "0.3.2-nightly-2024-01-11" }
+unit_schema = { path = "../../../../schemas/unit", id = "afl5yv5ya35vbuaj3aido22cwjzat25z", version = "0.3.2-nightly-2024-01-11" }
+
+explosion = { path = "../../../../std/explosion", id = "cneomdouziieskjvs3szwmigzotofjzs", version = "0.3.2-nightly-2024-01-11" }
+nameplates = { path = "../../../../std/nameplates", id = "per6j2iqhj3jz4da3fqr75jcj2kqjooo", version = "0.3.2-nightly-2024-01-11" }
+
+kenney_impact_sounds = { path = "../../../../assets/kenney_impact_sounds", id = "e4unr4x2lz2ov7dsd5vnjylbykwixvv2", version = "0.3.2-nightly-2024-01-11" }
+
+[messages.Input]
+name = "Input"
+description = "Input"
+[messages.Input.fields]
+direction = "Vec2"
+jump = "Bool"
+fire = "Bool"
+use_button = "Bool"
+sprint = "Bool"
+respawn = "Bool"
+aim_direction = "Vec2"
+# Let's not trust the client in the future
+aim_ray_origin = "Vec3"
+aim_ray_direction = "Vec3"
+
+[messages.UseFailed]
+name = "Use Failed"
+description = "Sent from the server to the client when a use action fails."
+fields = {}

@@ -2,12 +2,30 @@
     "version": "0.2.0",
     "configurations": [
         {
+            "type": "cppvsdbg",
+            "request": "launch",
+            "name": "ambient [windows debug]",
+            "program": "${workspaceFolder}/target/debug/ambient.exe",
+            "args": [
+                "run",
+                "guest/rust/examples/basics/primitives",
+            ],
+            "stopAtEntry": false,
+            "enableDebugHeap": false,
+            "cwd": "${workspaceFolder}",
+            "symbolOptions": {
+                "searchMicrosoftSymbolServer": true,
+            },
+        },
+        {
             "type": "lldb",
             "request": "launch",
             "name": "ambient [debug]",
             "cargo": {
                 "args": [
-                    "build"
+                    "build",
+                    "--features",
+                    "profile"
                 ],
                 "filter": {
                     "name": "ambient",
@@ -15,40 +33,14 @@
                 }
             },
             "env": {
-                "RUST_LOG": "info,wgpu=warn,naga=warn,quinn=warn,sentry=debug,sentry-anyhow=debug,sentry-core=debug,fbxcel=error",
+                "_NO_DEBUG_HEAP": "1",
+                "RUST_LOG": "info,wgpu=warn,naga=warn,quinn=warn,sentry=debug,sentry-anyhow=debug,sentry-core=debug,fbxcel=error,ambient_gpu=info",
                 "AMBIENT_DISABLE_TIMEOUT": "true",
                 "AMBIENT_DEBUGGER": "true"
             },
             "args": [
                 "run",
-                "guest/rust/examples/ui/slider",
-            ],
-            "cwd": "${workspaceFolder}",
-            "sourceLanguages": [
-                "rust"
-            ]
-        },
-        {
-            "type": "lldb",
-            "request": "launch",
-            "name": "ambient third_person [debug]",
-            "cargo": {
-                "args": [
-                    "build"
-                ],
-                "filter": {
-                    "name": "ambient",
-                    "kind": "bin"
-                }
-            },
-            "env": {
-                "RUST_LOG": "info,wgpu=warn,naga=warn,quinn=warn,sentry=debug,sentry-anyhow=debug,sentry-core=debug,fbxcel=error",
-                "AMBIENT_DISABLE_TIMEOUT": "true",
-                "AMBIENT_DEBUGGER": "true"
-            },
-            "args": [
-                "run",
-                "guest/rust/examples/basics/third_person_camera",
+                "guest/rust/examples/basics/primitives",
             ],
             "cwd": "${workspaceFolder}",
             "sourceLanguages": [
@@ -62,7 +54,9 @@
             "cargo": {
                 "args": [
                     "build",
-                    "--release"
+                    "--release",
+                    "--features",
+                    "profile"
                 ],
                 "filter": {
                     "name": "ambient",
@@ -75,6 +69,32 @@
             },
             "args": [],
             "cwd": "${workspaceFolder}",
+            "sourceLanguages": [
+                "rust"
+            ]
+        },
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Example 'crates/ambient_renderer/lod'",
+            "cargo": {
+                "args": [
+                    "build",
+                    "-p",
+                    "ambient_renderer",
+                    "--example",
+                    "lod"
+                ],
+                "filter": {
+                    "name": "lod",
+                    "kind": "example"
+                }
+            },
+            "env": {
+                "RUST_LOG": "info,wgpu=warn,naga=warn,quinn=warn,sentry=debug,sentry-anyhow=debug,sentry-core=debug,fbxcel=error",
+                "AMBIENT_DISABLE_TIMEOUT": "true"
+            },
+            "args": [],
             "sourceLanguages": [
                 "rust"
             ]
@@ -558,7 +578,7 @@
                 "args": [
                     "build",
                     "--example=button",
-                    "--package=ambient_ui"
+                    "--package=ambient_ui_native"
                 ],
                 "filter": {
                     "name": "button",
@@ -582,7 +602,7 @@
                 "args": [
                     "build",
                     "--example=dock_layout",
-                    "--package=ambient_ui"
+                    "--package=ambient_ui_native"
                 ],
                 "filter": {
                     "name": "dock_layout",
@@ -606,7 +626,7 @@
                 "args": [
                     "build",
                     "--example=element_editor",
-                    "--package=ambient_ui"
+                    "--package=ambient_ui_native"
                 ],
                 "filter": {
                     "name": "element_editor",
@@ -627,7 +647,7 @@
                 "args": [
                     "build",
                     "--example=flow_layout",
-                    "--package=ambient_ui"
+                    "--package=ambient_ui_native"
                 ],
                 "filter": {
                     "name": "flow_layout",
@@ -651,7 +671,7 @@
                 "args": [
                     "build",
                     "--example=image",
-                    "--package=ambient_ui"
+                    "--package=ambient_ui_native"
                 ],
                 "filter": {
                     "name": "image",
@@ -672,7 +692,7 @@
                 "args": [
                     "build",
                     "--example=input",
-                    "--package=ambient_ui"
+                    "--package=ambient_ui_native"
                 ],
                 "filter": {
                     "name": "input",
@@ -693,7 +713,7 @@
                 "args": [
                     "build",
                     "--example=rect",
-                    "--package=ambient_ui"
+                    "--package=ambient_ui_native"
                 ],
                 "filter": {
                     "name": "rect",
@@ -717,7 +737,7 @@
                 "args": [
                     "build",
                     "--example=screens",
-                    "--package=ambient_ui"
+                    "--package=ambient_ui_native"
                 ],
                 "filter": {
                     "name": "screens",
@@ -738,7 +758,7 @@
                 "args": [
                     "build",
                     "--example=slider",
-                    "--package=ambient_ui"
+                    "--package=ambient_ui_native"
                 ],
                 "filter": {
                     "name": "slider",
@@ -762,7 +782,7 @@
                 "args": [
                     "build",
                     "--example=text",
-                    "--package=ambient_ui"
+                    "--package=ambient_ui_native"
                 ],
                 "filter": {
                     "name": "text",
@@ -783,7 +803,7 @@
                 "args": [
                     "build",
                     "--example=todo",
-                    "--package=ambient_ui"
+                    "--package=ambient_ui_native"
                 ],
                 "filter": {
                     "name": "todo",
@@ -807,10 +827,31 @@
                 "args": [
                     "build",
                     "--example=ui",
-                    "--package=ambient_ui"
+                    "--package=ambient_ui_native"
                 ],
                 "filter": {
                     "name": "ui",
+                    "kind": "example"
+                }
+            },
+            "args": [],
+            "cwd": "${workspaceFolder}",
+            "sourceLanguages": [
+                "rust"
+            ]
+        },
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Example 'parse_ambient_schema' [debug]",
+            "cargo": {
+                "args": [
+                    "build",
+                    "--example=parse_ambient_schema",
+                    "--package=ambient_package_semantic"
+                ],
+                "filter": {
+                    "name": "parse_ambient_schema",
                     "kind": "example"
                 }
             },

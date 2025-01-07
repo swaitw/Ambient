@@ -1,13 +1,14 @@
-use std::{future::Future, task::Poll};
+use std::{future::Future, pin::Pin, task::Poll};
 
 use derive_more::{Deref, From};
 use futures::FutureExt;
+use pin_project::pin_project;
 
-use crate::{
-    control::ControlHandle,
-    platform::{self},
-};
+use crate::{control::ControlHandle, platform};
 pub use platform::task::wasm_nonsend;
+
+#[cfg(not(target_os = "unknown"))]
+pub use platform::task::make_native_multithreaded_runtime;
 
 /// Spawns a new background task in the current runtime
 pub fn spawn<F, T>(fut: F) -> JoinHandle<T>
@@ -86,7 +87,10 @@ impl<T> JoinHandle<T> {
 impl<T> Future for JoinHandle<T> {
     type Output = Result<T, JoinError>;
 
-    fn poll(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Self::Output> {
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
         self.0.poll_unpin(cx)
     }
 }
@@ -98,7 +102,10 @@ pub struct ChildTask<T>(JoinHandle<T>);
 impl<T> Future for ChildTask<T> {
     type Output = Result<T, JoinError>;
 
-    fn poll(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Self::Output> {
         self.0.poll_unpin(cx)
     }
 }
@@ -129,6 +136,16 @@ impl RuntimeHandle {
         JoinHandle(self.0.spawn(future))
     }
 
+    #[inline]
+    #[cfg(target_os = "unknown")]
+    pub fn spawn_local<F, T>(&self, future: F) -> JoinHandle<T>
+    where
+        F: 'static + Future<Output = T>,
+        T: 'static,
+    {
+        JoinHandle(self.0.spawn(future))
+    }
+
     pub fn block_in_place<R, F>(&self, f: F) -> R
     where
         F: FnOnce() -> R,
@@ -144,4 +161,91 @@ impl RuntimeHandle {
     {
         JoinHandle(self.0.spawn_blocking(f))
     }
+
+    /// Runs a future to completion on the current thread using this runtime
+    ///
+    /// This is only available on the native runtime, where Tokio is present and can be
+    /// used to run the future on the current thread.
+    ///
+    /// There is no equivalent operation for WASM.
+    #[cfg(not(target_os = "unknown"))]
+    pub fn block_on<F: Future>(&self, future: F) -> F::Output {
+        self.0.block_on(future)
+    }
 }
+
+#[must_use = "Futures do nothing if not polled"]
+pub struct PlatformBoxFuture<'a, T>(platform::task::PlatformBoxFutureImpl<'a, T>);
+
+impl<'a, T> PlatformBoxFuture<'a, T> {
+    #[cfg(target_os = "unknown")]
+    pub fn new<F>(future: F) -> Self
+    where
+        F: 'a + Future<Output = T>,
+    {
+        Self(platform::task::PlatformBoxFutureImpl::from_boxed(Box::pin(
+            future,
+        )))
+    }
+
+    #[cfg(not(target_os = "unknown"))]
+    pub fn new<F>(future: F) -> Self
+    where
+        F: 'a + Future<Output = T> + Send,
+    {
+        Self(platform::task::PlatformBoxFutureImpl::from_boxed(Box::pin(
+            future,
+        )))
+    }
+
+    #[cfg(target_os = "unknown")]
+    /// Convert this into a thread local future for [`wasm_bindgen_futures::spawn_local`] or
+    /// [`tokio::LocalSet`].
+    pub fn into_local(self) -> futures::future::LocalBoxFuture<'a, T> {
+        self.0.into_local()
+    }
+
+    #[cfg(not(target_os = "unknown"))]
+    /// Convert into a sendable future, sutable for [`tokio::spawn`].
+    pub fn into_shared(self) -> futures::future::BoxFuture<'a, T> {
+        self.0.into_shared()
+    }
+}
+
+impl<'a, T> Future for PlatformBoxFuture<'a, T> {
+    type Output = T;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+        self.0.poll_unpin(cx)
+    }
+}
+
+/// A cooperative future
+#[pin_project]
+pub struct Cooperative<F> {
+    max_budget: usize,
+    current_budget: usize,
+    #[pin]
+    fut: F,
+}
+
+impl<F> Cooperative<F> {
+    pub fn new(fut: F) -> Self {
+        Self {
+            max_budget: 1024,
+            current_budget: 1024,
+            fut,
+        }
+    }
+
+    pub fn with_budget(mut self, budget: usize) -> Self {
+        self.max_budget = budget;
+        self
+    }
+}
+
+// impl<F: Future> Future for Cooperative<F> {
+//     type Output = F::Output;
+
+//     fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {}
+// }

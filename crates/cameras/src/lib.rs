@@ -1,7 +1,7 @@
 use ambient_core::{camera::*, transform::*, ui_scene};
 use ambient_ecs::{components, EntityId, Networked, Store, SystemGroup};
 use ambient_element::{element_component, Element, Hooks};
-use ambient_std::shapes::BoundingBox;
+use ambient_native_std::shapes::BoundingBox;
 use glam::{Quat, Vec3};
 use winit::event::Event;
 
@@ -22,7 +22,13 @@ pub fn init_all_components() {
 }
 
 pub fn assets_camera_systems() -> SystemGroup<Event<'static, ()>> {
-    SystemGroup::new("assets_camera_systems", vec![Box::new(free_camera_system()), Box::new(spherical_camera_system())])
+    SystemGroup::new(
+        "assets_camera_systems",
+        vec![
+            Box::new(free_camera_system()),
+            Box::new(spherical_camera_system()),
+        ],
+    )
 }
 
 #[element_component]
@@ -37,13 +43,22 @@ pub fn UICamera(_: &mut Hooks) -> Element {
         .init(orthographic_right(), 100.)
         .init(orthographic_top(), 0.)
         .init(orthographic_bottom(), 100.)
-        .init(orthographic_rect(), OrthographicRect { left: 0.0, right: 100., top: 0., bottom: 100. })
+        .init(
+            orthographic_rect(),
+            OrthographicRect {
+                left: 0.0,
+                right: 100.,
+                top: 0.,
+                bottom: 100.,
+            },
+        )
         .init_default(projection())
         .init_default(projection_view())
         .init_default(translation())
         .init_default(rotation())
         .init(orthographic_from_window(), EntityId::resources())
         .init_default(ui_scene())
+        .init(active_camera(), 0.)
 }
 
 #[element_component]
@@ -58,9 +73,9 @@ pub fn LookatCamera(_: &mut Hooks, eye: Vec3, lookat: Vec3, up: Vec3) -> Element
         .init(aspect_ratio_from_window(), EntityId::resources())
         .init_default(projection())
         .init_default(projection_view())
-        .set(translation(), eye)
-        .set(lookat_center(), lookat)
-        .set(lookat_up(), up)
+        .with(translation(), eye)
+        .with(lookat_target(), lookat)
+        .with(lookat_up(), up)
 }
 
 #[element_component]
@@ -75,11 +90,18 @@ pub fn FreeCamera(_: &mut Hooks, position: Vec3, rotation: Quat) -> Element {
         .init(aspect_ratio_from_window(), EntityId::resources())
         .init_default(projection())
         .init_default(projection_view())
-        .set(ambient_core::transform::translation(), position)
-        .set(ambient_core::transform::rotation(), rotation)
+        .with(ambient_core::transform::translation(), position)
+        .with(ambient_core::transform::rotation(), rotation)
 }
 
 #[element_component]
-pub fn FittedOrthographicCamera(_: &mut Hooks, eye: Vec3, lookat: Vec3, up: Vec3, fit: BoundingBox, aspect: f32) -> Element {
+pub fn FittedOrthographicCamera(
+    _: &mut Hooks,
+    eye: Vec3,
+    lookat: Vec3,
+    up: Vec3,
+    fit: BoundingBox,
+    aspect: f32,
+) -> Element {
     Element::new().extend(Camera::fitted_ortographic(eye, lookat, up, fit, aspect).to_entity_data())
 }

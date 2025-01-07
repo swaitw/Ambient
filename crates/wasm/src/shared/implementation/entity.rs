@@ -1,17 +1,19 @@
 use std::collections::HashSet;
 
-use ambient_animation::animation_controller;
-use ambient_core::transform::translation;
+use ambient_core::transform::{local_to_world, translation};
 use ambient_ecs::{query as ecs_query, with_component_registry, EntityId, World};
+
 use ambient_network::ServerWorldExt;
+
 use anyhow::Context;
+use glam::Mat4;
 
 use super::{
     super::{
         conversion::{FromBindgen, IntoBindgen},
         wit,
     },
-    component::convert_components_to_entity_data,
+    component::{host_entity_to_wit_entity, wit_entity_to_host_entity},
 };
 
 pub fn spawn(
@@ -19,7 +21,7 @@ pub fn spawn(
     spawned_entities: &mut HashSet<EntityId>,
     data: wit::entity::EntityData,
 ) -> anyhow::Result<wit::types::EntityId> {
-    let id = convert_components_to_entity_data(data).spawn(world);
+    let id = wit_entity_to_host_entity(data)?.spawn(world);
     spawned_entities.insert(id);
     Ok(id.into_bindgen())
 }
@@ -28,22 +30,36 @@ pub fn despawn(
     world: &mut World,
     spawned_entities: &mut HashSet<EntityId>,
     id: wit::types::EntityId,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<Option<wit::entity::EntityData>> {
     let id = id.from_bindgen();
     spawned_entities.remove(&id);
-    Ok(world.despawn(id).is_some())
+    world.despawn(id).map(host_entity_to_wit_entity).transpose()
 }
 
-pub fn set_animation_controller(
-    world: &mut World,
-    entity: wit::types::EntityId,
-    controller: wit::entity::AnimationController,
-) -> anyhow::Result<()> {
-    Ok(world.add_component(
-        entity.from_bindgen(),
-        animation_controller(),
-        controller.from_bindgen(),
-    )?)
+pub fn get_transforms_relative_to(
+    world: &World,
+    list: Vec<wit::types::EntityId>,
+    origin: wit::types::EntityId,
+) -> anyhow::Result<Vec<wit::types::Mat4>> {
+    let origin_id = origin.from_bindgen();
+
+    let transform = world
+        .get(origin_id, local_to_world())
+        .unwrap_or(Mat4::IDENTITY)
+        .inverse();
+
+    let mut result = Vec::with_capacity(list.len());
+
+    for entity in list {
+        let entity_id = entity.from_bindgen();
+        let relative = transform
+            * world
+                .get(entity_id, local_to_world())
+                .unwrap_or(Mat4::IDENTITY);
+        result.push(relative.into_bindgen());
+    }
+
+    Ok(result)
 }
 
 pub fn exists(world: &World, entity: wit::types::EntityId) -> anyhow::Result<bool> {

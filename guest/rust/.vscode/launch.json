@@ -1,0 +1,565 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "assets/basic_model",
+            "type": "lldb",
+            "request": "launch",
+            "program": "ambient",
+            "args": [
+                "run",
+                "--debugger"
+            ],
+            "initCommands": [
+                "settings set plugin.jit-loader.gdb.enable on"
+            ],
+            "cwd": "${workspaceFolder}/examples/assets/basic_model"
+        },
+        {
+            "name": "assets/generate_pipeline",
+            "type": "lldb",
+            "request": "launch",
+            "program": "ambient",
+            "args": [
+                "run",
+                "--debugger"
+            ],
+            "initCommands": [
+                "settings set plugin.jit-loader.gdb.enable on"
+            ],
+            "cwd": "${workspaceFolder}/examples/assets/generate_pipeline"
+        },
+        {
+            "name": "assets/material_overriding",
+            "type": "lldb",
+            "request": "launch",
+            "program": "ambient",
+            "args": [
+                "run",
+                "--debugger"
+            ],
+            "initCommands": [
+                "settings set plugin.jit-loader.gdb.enable on"
+            ],
+            "cwd": "${workspaceFolder}/examples/assets/material_overriding"
+        },
+        {
+            "name": "assets/unity",
+            "type": "lldb",
+            "request": "launch",
+            "program": "ambient",
+            "args": [
+                "run",
+                "--debugger"
+            ],
+            "initCommands": [
+                "settings set plugin.jit-loader.gdb.enable on"
+            ],
+            "cwd": "${workspaceFolder}/examples/assets/unity"
+        },
+        {
+            "name": "basics/input",
+            "type": "lldb",
+            "request": "launch",
+            "program": "ambient",
+            "args": [
+                "run",
+                "--debugger"
+            ],
+            "initCommands": [
+                "settings set plugin.jit-loader.gdb.enable on"
+            ],
+            "cwd": "${workspaceFolder}/examples/basics/input"
+        },
+        {
+            "name": "basics/multiplayer",
+            "type": "lldb",
+            "request": "launch",
+            "program": "ambient",
+            "args": [
+                "run",
+                "--debugger"
+            ],
+            "initCommands": [
+                "settings set plugin.jit-loader.gdb.enable on"
+            ],
+            "cwd": "${workspaceFolder}/examples/basics/multiplayer"
+        },
+        {
+            "name": "basics/physics",
+            "type": "lldb",
+            "request": "launch",
+            "program": "ambient",
+            "args": [
+                "run",
+                "--debugger"
+            ],
+            "initCommands": [
+                "settings set plugin.jit-loader.gdb.enable on"
+            ],
+            "cwd": "${workspaceFolder}/examples/basics/physics"
+        },
+        {
+            "name": "basics/primitives",
+            "type": "lldb",
+            "request": "launch",
+            "program": "ambient",
+            "args": [
+                "run",
+                "--debugger"
+            ],
+            "initCommands": [
+                "settings set plugin.jit-loader.gdb.enable on"
+            ],
+            "cwd": "${workspaceFolder}/examples/basics/primitives"
+        },
+        {
+            "name": "basics/skinmesh",
+            "type": "lldb",
+            "request": "launch",
+            "program": "ambient",
+            "args": [
+                "run",
+                "--debugger"
+            ],
+            "initCommands": [
+                "settings set plugin.jit-loader.gdb.enable on"
+            ],
+            "cwd": "${workspaceFolder}/examples/basics/skinmesh"
+        },
+        {
+            "name": "controllers/first_person_camera",
+            "type": "lldb",
+            "request": "launch",
+            "program": "ambient",
+            "args": [
+                "run",
+                "--debugger"
+            ],
+            "initCommands": [
+                "settings set plugin.jit-loader.gdb.enable on"
+            ],
+            "cwd": "${workspaceFolder}/examples/controllers/first_person_camera"
+        },
+        {
+            "name": "controllers/third_person_camera",
+            "type": "lldb",
+            "request": "launch",
+            "program": "ambient",
+            "args": [
+                "run",
+                "--debugger"
+            ],
+            "initCommands": [
+                "settings set plugin.jit-loader.gdb.enable on"
+            ],
+            "cwd": "${workspaceFolder}/examples/controllers/third_person_camera"
+        },
+        {
+            "name": "intermediate/async",
+            "type": "lldb",
+            "request": "launch",
+            "program": "ambient",
+            "args": [
+                "run",
+                "--debugger"
+            ],
+            "initCommands": [
+                "settings set plugin.jit-loader.gdb.enable on"
+            ],
+            "cwd": "${workspaceFolder}/examples/intermediate/async"
+        },
+        {
+            "name": "intermediate/clientside",
+            "type": "lldb",
+            "request": "launch",
+            "program": "ambient",
+            "args": [
+                "run",
+                "--debugger"
+            ],
+            "initCommands": [
+                "settings set plugin.jit-loader.gdb.enable on"
+            ],
+            "cwd": "${workspaceFolder}/examples/intermediate/clientside"
+        },
+        {
+            "name": "intermediate/dependencies",
+            "type": "lldb",
+            "request": "launch",
+            "program": "ambient",
+            "args": [
+                "run",
+                "--debugger"
+            ],
+            "initCommands": [
+                "settings set plugin.jit-loader.gdb.enable on"
+            ],
+            "cwd": "${workspaceFolder}/examples/intermediate/dependencies"
+        },
+        {
+            "name": "intermediate/messaging",
+            "type": "lldb",
+            "request": "launch",
+            "program": "ambient",
+            "args": [
+                "run",
+                "--debugger"
+            ],
+            "initCommands": [
+                "settings set plugin.jit-loader.gdb.enable on"
+            ],
+            "cwd": "${workspaceFolder}/examples/intermediate/messaging"
+        },
+        {
+            "name": "intermediate/screen_ray",
+            "type": "lldb",
+            "request": "launch",
+            "program": "ambient",
+            "args": [
+                "run",
+                "--debugger"
+            ],
+            "initCommands": [
+                "settings set plugin.jit-loader.gdb.enable on"
+            ],
+            "cwd": "${workspaceFolder}/examples/intermediate/screen_ray"
+        },
+        {
+            "name": "rendering/decals",
+            "type": "lldb",
+            "request": "launch",
+            "program": "ambient",
+            "args": [
+                "run",
+                "--debugger"
+            ],
+            "initCommands": [
+                "settings set plugin.jit-loader.gdb.enable on"
+            ],
+            "cwd": "${workspaceFolder}/examples/rendering/decals"
+        },
+        {
+            "name": "rendering/fog",
+            "type": "lldb",
+            "request": "launch",
+            "program": "ambient",
+            "args": [
+                "run",
+                "--debugger"
+            ],
+            "initCommands": [
+                "settings set plugin.jit-loader.gdb.enable on"
+            ],
+            "cwd": "${workspaceFolder}/examples/rendering/fog"
+        },
+        {
+            "name": "rendering/image",
+            "type": "lldb",
+            "request": "launch",
+            "program": "ambient",
+            "args": [
+                "run",
+                "--debugger"
+            ],
+            "initCommands": [
+                "settings set plugin.jit-loader.gdb.enable on"
+            ],
+            "cwd": "${workspaceFolder}/examples/rendering/image"
+        },
+        {
+            "name": "rendering/instancing",
+            "type": "lldb",
+            "request": "launch",
+            "program": "ambient",
+            "args": [
+                "run",
+                "--debugger"
+            ],
+            "initCommands": [
+                "settings set plugin.jit-loader.gdb.enable on"
+            ],
+            "cwd": "${workspaceFolder}/examples/rendering/instancing"
+        },
+        {
+            "name": "rendering/procedural_generation",
+            "type": "lldb",
+            "request": "launch",
+            "program": "ambient",
+            "args": [
+                "run",
+                "--debugger"
+            ],
+            "initCommands": [
+                "settings set plugin.jit-loader.gdb.enable on"
+            ],
+            "cwd": "${workspaceFolder}/examples/rendering/procedural_generation"
+        },
+        {
+            "name": "rendering/raw_text",
+            "type": "lldb",
+            "request": "launch",
+            "program": "ambient",
+            "args": [
+                "run",
+                "--debugger"
+            ],
+            "initCommands": [
+                "settings set plugin.jit-loader.gdb.enable on"
+            ],
+            "cwd": "${workspaceFolder}/examples/rendering/raw_text"
+        },
+        {
+            "name": "rendering/samplers",
+            "type": "lldb",
+            "request": "launch",
+            "program": "ambient",
+            "args": [
+                "run",
+                "--debugger"
+            ],
+            "initCommands": [
+                "settings set plugin.jit-loader.gdb.enable on"
+            ],
+            "cwd": "${workspaceFolder}/examples/rendering/samplers"
+        },
+        {
+            "name": "rendering/sun",
+            "type": "lldb",
+            "request": "launch",
+            "program": "ambient",
+            "args": [
+                "run",
+                "--debugger"
+            ],
+            "initCommands": [
+                "settings set plugin.jit-loader.gdb.enable on"
+            ],
+            "cwd": "${workspaceFolder}/examples/rendering/sun"
+        },
+        {
+            "name": "rendering/transparency",
+            "type": "lldb",
+            "request": "launch",
+            "program": "ambient",
+            "args": [
+                "run",
+                "--debugger"
+            ],
+            "initCommands": [
+                "settings set plugin.jit-loader.gdb.enable on"
+            ],
+            "cwd": "${workspaceFolder}/examples/rendering/transparency"
+        },
+        {
+            "name": "ui/audio_ctrl",
+            "type": "lldb",
+            "request": "launch",
+            "program": "ambient",
+            "args": [
+                "run",
+                "--debugger"
+            ],
+            "initCommands": [
+                "settings set plugin.jit-loader.gdb.enable on"
+            ],
+            "cwd": "${workspaceFolder}/examples/ui/audio_ctrl"
+        },
+        {
+            "name": "ui/auto_editor",
+            "type": "lldb",
+            "request": "launch",
+            "program": "ambient",
+            "args": [
+                "run",
+                "--debugger"
+            ],
+            "initCommands": [
+                "settings set plugin.jit-loader.gdb.enable on"
+            ],
+            "cwd": "${workspaceFolder}/examples/ui/auto_editor"
+        },
+        {
+            "name": "ui/button",
+            "type": "lldb",
+            "request": "launch",
+            "program": "ambient",
+            "args": [
+                "run",
+                "--debugger"
+            ],
+            "initCommands": [
+                "settings set plugin.jit-loader.gdb.enable on"
+            ],
+            "cwd": "${workspaceFolder}/examples/ui/button"
+        },
+        {
+            "name": "ui/clock",
+            "type": "lldb",
+            "request": "launch",
+            "program": "ambient",
+            "args": [
+                "run",
+                "--debugger"
+            ],
+            "initCommands": [
+                "settings set plugin.jit-loader.gdb.enable on"
+            ],
+            "cwd": "${workspaceFolder}/examples/ui/clock"
+        },
+        {
+            "name": "ui/counter",
+            "type": "lldb",
+            "request": "launch",
+            "program": "ambient",
+            "args": [
+                "run",
+                "--debugger"
+            ],
+            "initCommands": [
+                "settings set plugin.jit-loader.gdb.enable on"
+            ],
+            "cwd": "${workspaceFolder}/examples/ui/counter"
+        },
+        {
+            "name": "ui/dock_layout",
+            "type": "lldb",
+            "request": "launch",
+            "program": "ambient",
+            "args": [
+                "run",
+                "--debugger"
+            ],
+            "initCommands": [
+                "settings set plugin.jit-loader.gdb.enable on"
+            ],
+            "cwd": "${workspaceFolder}/examples/ui/dock_layout"
+        },
+        {
+            "name": "ui/editors",
+            "type": "lldb",
+            "request": "launch",
+            "program": "ambient",
+            "args": [
+                "run",
+                "--debugger"
+            ],
+            "initCommands": [
+                "settings set plugin.jit-loader.gdb.enable on"
+            ],
+            "cwd": "${workspaceFolder}/examples/ui/editors"
+        },
+        {
+            "name": "ui/flow_layout",
+            "type": "lldb",
+            "request": "launch",
+            "program": "ambient",
+            "args": [
+                "run",
+                "--debugger"
+            ],
+            "initCommands": [
+                "settings set plugin.jit-loader.gdb.enable on"
+            ],
+            "cwd": "${workspaceFolder}/examples/ui/flow_layout"
+        },
+        {
+            "name": "ui/image",
+            "type": "lldb",
+            "request": "launch",
+            "program": "ambient",
+            "args": [
+                "run",
+                "--debugger"
+            ],
+            "initCommands": [
+                "settings set plugin.jit-loader.gdb.enable on"
+            ],
+            "cwd": "${workspaceFolder}/examples/ui/image"
+        },
+        {
+            "name": "ui/rect",
+            "type": "lldb",
+            "request": "launch",
+            "program": "ambient",
+            "args": [
+                "run",
+                "--debugger"
+            ],
+            "initCommands": [
+                "settings set plugin.jit-loader.gdb.enable on"
+            ],
+            "cwd": "${workspaceFolder}/examples/ui/rect"
+        },
+        {
+            "name": "ui/screens",
+            "type": "lldb",
+            "request": "launch",
+            "program": "ambient",
+            "args": [
+                "run",
+                "--debugger"
+            ],
+            "initCommands": [
+                "settings set plugin.jit-loader.gdb.enable on"
+            ],
+            "cwd": "${workspaceFolder}/examples/ui/screens"
+        },
+        {
+            "name": "ui/scroll",
+            "type": "lldb",
+            "request": "launch",
+            "program": "ambient",
+            "args": [
+                "run",
+                "--debugger"
+            ],
+            "initCommands": [
+                "settings set plugin.jit-loader.gdb.enable on"
+            ],
+            "cwd": "${workspaceFolder}/examples/ui/scroll"
+        },
+        {
+            "name": "ui/slider",
+            "type": "lldb",
+            "request": "launch",
+            "program": "ambient",
+            "args": [
+                "run",
+                "--debugger"
+            ],
+            "initCommands": [
+                "settings set plugin.jit-loader.gdb.enable on"
+            ],
+            "cwd": "${workspaceFolder}/examples/ui/slider"
+        },
+        {
+            "name": "ui/text",
+            "type": "lldb",
+            "request": "launch",
+            "program": "ambient",
+            "args": [
+                "run",
+                "--debugger"
+            ],
+            "initCommands": [
+                "settings set plugin.jit-loader.gdb.enable on"
+            ],
+            "cwd": "${workspaceFolder}/examples/ui/text"
+        },
+        {
+            "name": "ui/todo",
+            "type": "lldb",
+            "request": "launch",
+            "program": "ambient",
+            "args": [
+                "run",
+                "--debugger"
+            ],
+            "initCommands": [
+                "settings set plugin.jit-loader.gdb.enable on"
+            ],
+            "cwd": "${workspaceFolder}/examples/ui/todo"
+        }
+    ]
+}

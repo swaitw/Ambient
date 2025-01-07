@@ -1,0 +1,26 @@
+[package]
+name = "ambient_example_procedural_generation"
+
+edition = "2021"
+publish = false
+rust-version = { workspace = true }
+version = { workspace = true }
+
+[dependencies]
+ambient_api = { workspace = true }
+rand = "0.8.5"
+rand_pcg = "0.3.1"
+noise = { version = "0.8.2", features = ["images"] }
+palette = "0.7.1"
+
+[build-dependencies]
+ambient_package_projection = { workspace = true }
+
+[[bin]]
+name = "procedural_generation_client"
+path = "src/client.rs"
+required-features = ["client"]
+
+[features]
+client = ["ambient_api/client"]
+server = ["ambient_api/server"]

@@ -1,18 +1,21 @@
 [package]
-name = "skinmesh"
+name = "ambient_example_skinmesh"
 
 edition = "2021"
 publish = false
-rust-version = {workspace = true}
-version = {workspace = true}
+rust-version = { workspace = true }
+version = { workspace = true }
 
 [dependencies]
-ambient_api = {path = "../../../api"}
+ambient_api = { workspace = true }
+
+[build-dependencies]
+ambient_package_projection = { workspace = true }
 
 [[bin]]
-name = "skinmesh_server"
-path = "src/server.rs"
-required-features = ["server"]
+name = "client_skinmesh"
+path = "src/client.rs"
+required-features = ["client"]
 
 [features]
 client = ["ambient_api/client"]

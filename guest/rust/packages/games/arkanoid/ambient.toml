@@ -1,0 +1,30 @@
+[package]
+id = "t6opuz533binrqqjsbgcezprtfa6vpyy"
+name = "Arkanoid"
+description = "A remake of the classic Arkanoid game."
+version = "0.3.2-nightly-2024-01-11"
+repository = "https://github.com/AmbientRun/Ambient/tree/main/guest/rust/packages/games/arkanoid"
+type = "Game"
+content = { type = "Playable" }
+ambient_version = "0.3.2-nightly-2024-01-11"
+
+[hosting]
+region = "Auto"
+max_players = 1
+
+[components]
+player_movement_direction = { type = "F32", name = "Player Movement Direction", description = "Direction of player movement" }
+track_audio_url = { type = "String", name = "Track Audio URL", description = "URL of the track audio", attributes = [
+    "Networked",
+    "Debuggable",
+] }
+
+[messages.Input]
+description = "Describes the input state of the player."
+[messages.Input.fields]
+direction = "F32"
+start = "Bool"
+
+[messages.Ping]
+description = "Time to ping sound."
+fields = {}

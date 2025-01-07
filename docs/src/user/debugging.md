@@ -1,14 +1,16 @@
 # Debugging
 
-## ECS
+## Running with the debugger
 
-When the client is run with the `AMBIENT_DEBUGGER` environment variable, or with the `--debugger` flag, several buttons are shown at the top:
+When the client is run with the `AMBIENT_DEBUGGER` environment variable, or with the `--debugger` flag, the game is surrounded with a debugger:
 
 ```sh
-AMBIENT_DEBUGGER=1 ambient run examples/minigolf # or `$env:AMBIENT_DEBUGGER=1` on Windows/PowerShell, or `ambient run --debugger examples/minigolf`
+AMBIENT_DEBUGGER=1 ambient run examples/minigolf
+# or `$env:AMBIENT_DEBUGGER=1` on Windows/PowerShell
+# or `ambient run --debugger examples/minigolf`
 ```
 
-![Debug buttons at the top of the window with `AMBIENT_DEBUGGER`](debug_buttons.png)
+![Debugger surrounding the game with `AMBIENT_DEBUGGER`](debugger.png)
 
 These can be used to inspect the state of the client and server ECSes, as well as the renderer. When one of these buttons are pressed, a YAML file will be created with the corresponding state, and its path will be written to `stdout`:
 
@@ -41,14 +43,31 @@ Here is some sample output for the server ECS:
       children: []
 ```
 
+## Increasing log output
+
+You can also increase the logging output from specific internal modules using the `RUST_LOG` environment variable,
+which accepts `module=log_level` pairs that are comma-sepparated. Here are some general tips:
+
+- To debug **your asset pipeline**, set `RUST_LOG=ambient_build=info`. For even more logs, you can set `RUST_LOG=ambient_build=info,ambient_model_import=info`.
+- To debug **rendering**, set `RUST_LOG=ambient_renderer=info`.
+- To debug **networking**, set `RUST_LOG=ambient_network=info`.
+- To debug **physics**, set `RUST_LOG=ambient_physics=info`.
+- To debug everything, set `RUST_LOG=info`. To get even more logs set `RUST_LOG=debug`.
+
 ## Physics
 
 Ambient uses PhysX 4.1 from Nvidia for physics simulation. As a result, the entire physics scene can be visualized using the [PhysX Visual Debugger (PVD)](https://developer.nvidia.com/physx-visual-debugger).
 
-By default, physics debugging is on. To debug your scene, install and start PVD, then start an Ambient project. Your project's scene should automatically be visible within PVD. For more details on how to use PVD, see the [guide](https://gameworksdocs.nvidia.com/PhysX/4.1/documentation/physxguide/Manual/VisualDebugger.html).
+By default, physics debugging is on. To debug your scene, install and start PVD, then start an Ambient package. Your package's scene should automatically be visible within PVD. For more details on how to use PVD, see the [guide](https://gameworksdocs.nvidia.com/PhysX/4.1/documentation/physxguide/Manual/VisualDebugger.html).
 
 ## Assets
 
-When assets are compiled by the assets pipeline, the resulting artifacts will be output to the `build` directory in your project. These can be examined to determine whether or not your source was accurately compiled by the asset pipeline.
+When assets are compiled by the assets pipeline, the resulting artifacts will be output to the `build` directory in your package. These can be examined to determine whether or not your source was accurately compiled by the asset pipeline.
 
 Additionally, if there are fatal errors or warnings, the asset pipeline will report them during the compilation process.
+
+## Networking
+
+### Debugging which components are sent over the network
+
+Use the environment flag `AMBIENT_DEBUG_ENTITY_STREAM` to debug entities and components sent over the network to the client. `AMBIENT_DEBUG_ENTITY_STREAM=FULL` will output everything, `AMBIENT_DEBUG_ENTITY_STREAM=true` (or anything else) will output a summary.

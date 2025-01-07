@@ -1,29 +1,19 @@
-use ambient_api::prelude::*;
-use ambient_element::{element_component, Element, ElementComponentExt, Hooks};
-use ambient_ui_components::{setup_ui_camera, text::Text};
+use ambient_api::{core::layout::components::space_between_items, element::use_state, prelude::*};
+
+pub mod packages;
+
+#[main]
+pub fn main() {
+    App.el().spawn_interactive();
+}
 
 #[element_component]
 fn App(hooks: &mut Hooks) -> Element {
-    let (count, set_count) = hooks.use_state(0);
-    hooks.use_spawn(move |_| {
-        run_async(async move {
-            let mut count = 0;
-            loop {
-                sleep(0.5).await;
-                count += 1;
-                set_count(count);
-            }
-        });
-        Box::new(|_| {})
-    });
-    println!("{count}");
-    Text::el(format!("We've counted to {count} now"))
-}
-
-#[main]
-pub async fn main() -> EventResult {
-    setup_ui_camera();
-    App.el().spawn_interactive();
-
-    EventOk
+    let (count, set_count) = use_state(hooks, 0);
+    FlowColumn::el([
+        Text::el(format!("We've counted to {count} now")),
+        Button::new("Increase", move |_| set_count(count + 1)).el(),
+    ])
+    .with_padding_even(STREET)
+    .with(space_between_items(), STREET)
 }

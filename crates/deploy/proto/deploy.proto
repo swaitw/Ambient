@@ -1,0 +1,44 @@
+syntax = "proto3";
+
+package ambient.run.deploy;
+
+message AssetContent {
+  string path = 1;
+  uint64 totalSize = 2;
+  oneof contentDescription {
+    // MD5 hash of the file contents (128 bits = 16 bytes)
+    bytes md5 = 3;
+    // Chunk of the file contents - chunks must be sent in order
+    bytes chunk = 4;
+  }
+}
+
+message DeployAssetRequest {
+  string packageId = 1;
+  repeated AssetContent contents = 2;
+}
+
+message Deployment {
+  // ID of the deployment
+  string id = 1;
+}
+
+message DeployAssetResponse {
+  oneof message {
+    // Deployment finished successfully
+    Deployment finished = 1;
+    // Error during deployment (unable to continue)
+    string error = 2;
+    // Path of an asset that was successfully deployed
+    string acceptedPath = 3;
+    // Path of an asset with missing contents. Only sent as a response to MD5 requests.
+    // Client should send the missing AssetContent with contents.
+    string missingPath = 4;
+    // Warning message, not critical to the deployment but should be presented to the user as a warning
+    string warning = 5;
+  }
+}
+
+service Deployer {
+  rpc DeployAssets(stream DeployAssetRequest) returns (stream DeployAssetResponse) {}
+}

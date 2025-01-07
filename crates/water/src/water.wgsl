@@ -1,6 +1,6 @@
 
 
-@group(#MATERIAL_BIND_GROUP)
+@group(MATERIAL_BIND_GROUP)
 @binding(0)
 var normals_texture: texture_2d<f32>;
 
@@ -29,19 +29,21 @@ fn screen_space_reflections(world_position: vec3<f32>, screen_ray_dir: vec3<f32>
     for (var i = 0; i < 5; i = i + 1) {
         let pos_ndc = project_point(global_params.projection_view, pos);
         let screen_tc = screen_ndc_to_uv(pos_ndc);
-        if (screen_tc.x < 0. || screen_tc.x >= 1. || screen_tc.y < 0. || screen_tc.y >= 1.) {
+        if screen_tc.x < 0. || screen_tc.x >= 1. || screen_tc.y < 0. || screen_tc.y >= 1. {
             continue;
         }
-        let screen_depth = textureSampleLevel(solids_screen_depth, default_sampler, screen_tc, 0.);
-        if (pos_ndc.z >= screen_depth && pos_ndc.z < screen_depth * 1.001 && screen_depth < 0.9999) {
-            return textureSampleLevel(solids_screen_color, default_sampler, screen_tc, 0.).rgb;
+        // HACKFIX: https://github.com/AmbientRun/Ambient/issues/1098
+        // Remove `ZERO_INTEGER_ON_WEB_FLOAT_ON_NATIVE` once https://github.com/gfx-rs/naga/issues/2582 is fixed
+        let screen_depth = textureSampleLevel(solids_screen_depth, default_sampler, screen_tc, ZERO_INTEGER_ON_WEB_FLOAT_ON_NATIVE);
+        if pos_ndc.z >= screen_depth && pos_ndc.z < screen_depth * 1.001 && screen_depth < 0.999 {
+            return textureSampleLevel(solids_screen_color, default_sampler, screen_tc, 0.0).rgb;
         }
         step = step * 2.;
         pos = pos + step;
     }
     let sc = to_spherical_coordinates(reflected_dir);
     let tc = vec2<f32>(sc.z / (PI * 2.), sc.y / (PI * 1.));
-    let sky = get_sky_color(global_params.camera_far, world_position, reflected_dir).rgb;
+    let sky = get_sky_color(global_params.camera_far, world_position, reflected_dir);
     return sky;
 }
 
@@ -50,8 +52,12 @@ fn get_material(in: MaterialInput) -> MaterialOutput {
 
     let screen_size = vec2<f32>(textureDimensions(solids_screen_depth));
 
-    let normal_t1 = textureSample(normals_texture, default_sampler, in.world_position.xy * 0.05 + vec2<f32>(global_params.time * 0.01, 0.)).xyz;
-    let normal_t2 = textureSample(normals_texture, default_sampler, in.world_position.xy * 0.1 + vec2<f32>(0., global_params.time * 0.02)).xyz;
+    let normal_uv1 = in.world_position.xy * 0.05 + vec2<f32>(global_params.time * 0.01, 0.0);
+    let normal_uv2 = in.world_position.xy * 0.13 + vec2<f32>(0.0, global_params.time * 0.024);
+
+    let normal_t1 = textureSample(normals_texture, default_sampler, fract(normal_uv1)).xyz;
+    let normal_t2 = textureSample(normals_texture, default_sampler, fract(normal_uv2)).xyz;
+
     let normal_t = (normal_t1 + normal_t2) / 2.;
     let normal = normalize(normal_t * 2. - 1.);
 

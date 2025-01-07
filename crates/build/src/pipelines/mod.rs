@@ -1,121 +1,108 @@
 use std::{collections::HashSet, sync::Arc};
 
 use ambient_asset_cache::SyncAssetKey;
-use ambient_std::{asset_cache::AssetCache, asset_url::AbsAssetUrl};
+use ambient_native_std::{asset_cache::AssetCache, asset_url::AbsAssetUrl};
+use ambient_pipeline_types::{models::ModelsPipeline, Pipeline, PipelineProcessor, PipelinesFile};
 use anyhow::Context;
 use context::PipelineCtx;
-use futures::{future::BoxFuture, StreamExt};
+use futures::{
+    future::{ready, BoxFuture},
+    stream, Stream, StreamExt, TryStreamExt,
+};
 use image::ImageFormat;
 use out_asset::{OutAsset, OutAssetContent, OutAssetPreview};
-use serde::{Deserialize, Serialize};
-
-use self::{materials::MaterialsPipeline, models::ModelsPipeline};
 
 pub mod audio;
 pub mod context;
+pub mod importer;
 pub mod materials;
 pub mod models;
 pub mod out_asset;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type")]
-pub enum PipelineConfig {
-    /// The models asset pipeline.
-    /// Will import models (including constituent materials and animations) and generate prefabs for them by default.
-    Models(ModelsPipeline),
-    /// The materials asset pipeline.
-    /// Will import specific materials without needing to be part of a model.
-    Materials(MaterialsPipeline),
-    /// The audio asset pipeline.
-    /// Will import supported audio file formats and produce Ogg Vorbis files to be used by the runtime.
-    Audio,
-}
+pub use importer::*;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type")]
-pub struct Pipeline {
-    /// The type of pipeline to use.
-    pub pipeline: PipelineConfig,
-    /// Filter the sources used to feed this pipeline.
-    /// This is a list of glob patterns for accepted files.
-    /// All files are accepted if this is empty.
-    #[serde(default)]
-    pub sources: Vec<String>,
-    /// Tags to apply to the output resources.
-    #[serde(default)]
-    pub tags: Vec<String>,
-    /// Categories to apply to the output resources.
-    #[serde(default)]
-    pub categories: Vec<Vec<String>>,
-}
-impl Pipeline {
-    pub async fn process(&self, ctx: PipelineCtx) -> Vec<OutAsset> {
-        let mut assets = match &self.pipeline {
-            PipelineConfig::Models(config) => models::pipeline(&ctx, config.clone()).await,
-            PipelineConfig::Materials(config) => materials::pipeline(&ctx, config.clone()).await,
-            PipelineConfig::Audio => audio::pipeline(&ctx).await,
-        };
-        for asset in &mut assets {
-            asset.tags.extend(self.tags.clone());
-            for i in 0..asset.categories.len() {
-                if let Some(cat) = self.categories.get(i) {
-                    asset.categories[i].extend(cat.iter().cloned().collect::<HashSet<_>>());
-                }
-            }
-        }
-        assets
-    }
-}
+pub async fn process_pipeline(pipeline: &Pipeline, ctx: PipelineCtx) -> Vec<OutAsset> {
+    tracing::debug!("Processing pipeline: {:?}", ctx.pipeline_path());
+    let mut assets = match &pipeline.processor {
+        PipelineProcessor::Models(config) => models::pipeline(&ctx, config.clone()).await,
+        PipelineProcessor::Materials(config) => materials::pipeline(&ctx, config.clone()).await,
+        PipelineProcessor::Audio(config) => audio::pipeline(&ctx, config.clone()).await,
+    };
 
-pub async fn process_pipelines(ctx: &ProcessCtx) -> Vec<OutAsset> {
-    log::info!("Processing pipeline with out_root={}", ctx.out_root);
-
-    #[derive(Debug, Clone, Deserialize)]
-    #[serde(untagged)]
-    enum PipelineOneOrMany {
-        Many(Vec<Pipeline>),
-        One(Pipeline),
-    }
-    impl PipelineOneOrMany {
-        fn into_vec(self) -> Vec<Pipeline> {
-            match self {
-                PipelineOneOrMany::Many(v) => v,
-                PipelineOneOrMany::One(p) => vec![p],
+    for asset in &mut assets {
+        asset.tags.extend(pipeline.tags.clone());
+        for i in 0..asset.categories.len() {
+            if let Some(cat) = pipeline.categories.get(i) {
+                asset.categories[i].extend(cat.iter().cloned().collect::<HashSet<_>>());
             }
         }
     }
 
-    futures::stream::iter(ctx.files.0.iter())
-        .filter_map(|file| async move {
-            let pipelines: PipelineOneOrMany = if file.0.path().ends_with("pipeline.json") {
-                file.download_json(&ctx.assets).await.unwrap()
-            } else {
-                return None;
-            };
-            Some((file, pipelines.into_vec()))
+    assets
+}
+
+fn get_pipelines(
+    ctx: &ProcessCtx,
+) -> impl Stream<Item = anyhow::Result<(&AbsAssetUrl, PipelinesFile)>> {
+    stream::iter(ctx.files.0.iter())
+        .filter(|file| {
+            ready(
+                file.decoded_path()
+                    .file_name()
+                    .unwrap_or_default()
+                    .ends_with("pipeline.toml"),
+            )
         })
-        .flat_map(|(file, pipelines)| {
-            futures::stream::iter(pipelines.into_iter().enumerate().map(|(i, pipeline)| {
-                let mut file = file.clone();
-                file.0.set_fragment(Some(&i.to_string()));
-                (file, pipeline)
-            }))
+        .then(move |file| async move {
+            tracing::debug!("Found pipeline file at {:?}, parsing...", file.0.path());
+            let schema = file
+                .download_toml::<PipelinesFile>(&ctx.assets)
+                .await
+                .with_context(|| format!("Failed to read pipeline at {:?}", file.0.path()))?;
+
+            Ok((file, schema))
         })
-        .map(|(pipeline_file, pipeline)| {
+}
+
+pub async fn process_pipelines(ctx: &ProcessCtx) -> anyhow::Result<Vec<OutAsset>> {
+    tracing::debug!(?ctx.out_root, "Processing pipelines");
+
+    get_pipelines(ctx)
+        .map_ok(|(file, pipelines)| {
+            tracing::debug!(
+                "Found pipelines file: {:?} with {} pipelines",
+                file.0.path(),
+                pipelines.pipelines.len()
+            );
+            futures::stream::iter(pipelines.pipelines.into_iter().enumerate().map(
+                |(i, pipeline)| {
+                    let mut file = file.clone();
+                    file.0.set_fragment(Some(&i.to_string()));
+                    Ok((file, pipeline)) as anyhow::Result<_>
+                },
+            ))
+        })
+        .try_flatten()
+        .map_ok(|(pipeline_file, pipeline): (AbsAssetUrl, Pipeline)| {
             let root = pipeline_file.join(".").unwrap();
             let ctx = PipelineCtx {
-                files: ctx.files.sub_directory(root.path().as_str()),
+                files: ctx.files.sub_directory(root.decoded_path().as_str()),
                 process_ctx: ctx.clone(),
                 pipeline: Arc::new(pipeline.clone()),
                 pipeline_file,
-                root_path: ctx.in_root.relative_path(root.path()),
+                root_path: ctx.in_root.relative_path(root.decoded_path()),
             };
-            tokio::spawn(async move { pipeline.process(ctx).await })
+
+            async move {
+                tokio::spawn(async move { process_pipeline(&pipeline, ctx).await })
+                    .await
+                    .context("Pipeline processing panicked")
+            }
         })
-        .buffered(30)
-        .map(|x| x.unwrap())
-        .flat_map(|out_assets| futures::stream::iter(out_assets.into_iter()))
-        .collect::<Vec<_>>()
+        .try_buffered(30)
+        .map_ok(|out_assets| futures::stream::iter(out_assets.into_iter().map(Ok)))
+        .try_flatten()
+        .try_collect::<Vec<_>>()
         .await
 }
 
@@ -125,39 +112,74 @@ impl SyncAssetKey<ProcessCtx> for ProcessCtxKey {}
 
 #[derive(Clone)]
 pub struct ProcessCtx {
-    pub assets: AssetCache,
-    pub files: FileCollection,
-    pub input_file_filter: Option<String>,
-    pub package_name: String,
-    pub in_root: AbsAssetUrl,
-    pub out_root: AbsAssetUrl,
-    pub write_file: Arc<dyn Fn(String, Vec<u8>) -> BoxFuture<'static, AbsAssetUrl> + Sync + Send>,
-    pub on_status: Arc<dyn Fn(String) -> BoxFuture<'static, ()> + Sync + Send>,
-    pub on_error: Arc<dyn Fn(anyhow::Error) -> BoxFuture<'static, ()> + Sync + Send>,
+    pub(crate) assets: AssetCache,
+    pub(crate) files: FileCollection,
+    pub(crate) input_file_filter: Option<String>,
+    pub(crate) package_name: String,
+    pub(crate) in_root: AbsAssetUrl,
+    pub(crate) out_root: AbsAssetUrl,
+    pub(crate) write_file:
+        Arc<dyn Fn(String, Vec<u8>) -> BoxFuture<'static, AbsAssetUrl> + Sync + Send>,
+    pub(crate) on_status: Arc<dyn Fn(String) -> BoxFuture<'static, ()> + Sync + Send>,
+    pub(crate) on_error: Arc<dyn Fn(anyhow::Error) -> BoxFuture<'static, ()> + Sync + Send>,
 }
-#[derive(Clone)]
-pub struct FileCollection(pub Arc<Vec<AbsAssetUrl>>);
+
+impl std::fmt::Debug for ProcessCtx {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProcessCtx")
+            .field("assets", &self.assets)
+            .field("files", &self.files)
+            .field("input_file_filter", &self.input_file_filter)
+            .field("package_name", &self.package_name)
+            .field("in_root", &self.in_root)
+            .field("out_root", &self.out_root)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct FileCollection(pub Arc<Vec<AbsAssetUrl>>);
 impl FileCollection {
     pub fn has_input_file(&self, url: &AbsAssetUrl) -> bool {
         self.0.iter().any(|x| x == url)
     }
     pub fn find_file_res(&self, glob_pattern: impl AsRef<str>) -> anyhow::Result<&AbsAssetUrl> {
-        self.find_file(&glob_pattern).with_context(|| format!("Failed to find file with pattern {}", glob_pattern.as_ref()))
+        self.find_file(&glob_pattern)
+            .with_context(|| format!("Failed to find file with pattern {}", glob_pattern.as_ref()))
     }
     pub fn find_file(&self, glob_pattern: impl AsRef<str>) -> Option<&AbsAssetUrl> {
         let pattern = glob::Pattern::new(glob_pattern.as_ref()).unwrap();
-        self.0.iter().find(|f| pattern.matches(f.path().as_str()))
+        self.0
+            .iter()
+            .find(|f| pattern.matches(f.decoded_path().as_str()))
     }
     pub fn sub_directory(&self, path: &str) -> Self {
-        Self(Arc::new(self.0.iter().filter(|url| url.path().starts_with(path)).cloned().collect()))
+        Self(Arc::new(
+            self.0
+                .iter()
+                .filter(|url| url.decoded_path().starts_with(path))
+                .cloned()
+                .collect(),
+        ))
     }
 }
 
-pub async fn download_image(assets: &AssetCache, url: &AbsAssetUrl) -> anyhow::Result<image::DynamicImage> {
+pub async fn download_image(
+    assets: &AssetCache,
+    url: &AbsAssetUrl,
+) -> anyhow::Result<image::DynamicImage> {
     let data = url.download_bytes(assets).await?;
-    if let Some(format) = url.extension().as_ref().and_then(ImageFormat::from_extension) {
-        Ok(image::load_from_memory_with_format(&data, format).with_context(|| format!("Failed to load image {url}"))?)
+    if let Some(format) = url
+        .extension()
+        .as_ref()
+        .and_then(ImageFormat::from_extension)
+    {
+        Ok(image::load_from_memory_with_format(&data, format)
+            .with_context(|| format!("Failed to load image {url}"))?)
     } else {
-        Ok(image::load_from_memory(&data).with_context(|| format!("Failed to load image {url}"))?)
+        Ok(
+            image::load_from_memory(&data)
+                .with_context(|| format!("Failed to load image {url}"))?,
+        )
     }
 }

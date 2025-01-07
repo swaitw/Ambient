@@ -2,4 +2,14 @@ examples/*/*/.cargo
 examples/*/*/.gitignore
 examples/*/*/build
 examples/*/*/target
-api/wit
+
+packages/*/*/build
+packages/*/*/build/src/packages.rs
+packages/*/*/mods/*/build
+
+testcases/*/.cargo
+testcases/*/.gitignore
+testcases/*/build
+testcases/*/target
+
+**/src/packages.rs

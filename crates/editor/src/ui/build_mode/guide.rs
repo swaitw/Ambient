@@ -5,11 +5,16 @@ use ambient_core::{
     transform::{local_to_world, mesh_to_world},
 };
 use ambient_ecs::{Entity, EntityId, World};
-use ambient_element::{Element, ElementComponent};
+use ambient_element::{
+    consume_context, use_effect, use_spawn, use_state_with, Element, ElementComponent,
+};
 use ambient_meshes::QuadMeshKey;
-use ambient_network::client::GameClient;
-use ambient_renderer::{color, double_sided, gpu_primitives, material, primitives, renderer_shader, SharedMaterial, StandardShaderKey};
-use ambient_std::{asset_cache::SyncAssetKeyExt, cb, shapes::AABB};
+use ambient_native_std::{asset_cache::SyncAssetKeyExt, cb, shapes::AABB};
+use ambient_network::client::ClientState;
+use ambient_renderer::{
+    color, double_sided, gpu_primitives_lod, gpu_primitives_mesh, material, primitives,
+    renderer_shader, SharedMaterial, StandardShaderKey,
+};
 use glam::{vec2, vec3, vec4, EulerRot, Mat4, Quat, Vec2, Vec3};
 
 use super::grid_material::{GridMaterialKey, GridShaderKey};
@@ -21,14 +26,18 @@ const LINE_WIDTH: f32 = 0.1;
 fn spawn_entity(world: &mut World, mat: SharedMaterial) -> EntityId {
     let assets = world.resource(asset_cache());
 
-    let aabb = AABB { min: vec3(-1., -1., 0.), max: vec3(1., 1., 0.) };
+    let aabb = AABB {
+        min: vec3(-1., -1., 0.),
+        max: vec3(1., 1., 0.),
+    };
 
     Entity::new()
         .with(mesh(), QuadMeshKey.get(assets))
-        .with_default(local_to_world())
-        .with_default(mesh_to_world())
+        .with(local_to_world(), Default::default())
+        .with(mesh_to_world(), Default::default())
         .with(primitives(), vec![])
-        .with_default(gpu_primitives())
+        .with(gpu_primitives_mesh(), Default::default())
+        .with(gpu_primitives_lod(), Default::default())
         .with(main_scene(), ())
         .with(local_bounding_aabb(), aabb)
         .with(world_bounding_sphere(), aabb.to_sphere())
@@ -39,8 +48,12 @@ fn spawn_entity(world: &mut World, mat: SharedMaterial) -> EntityId {
         .with(
             renderer_shader(),
             cb(|assets, config| {
-                StandardShaderKey { material_shader: GridShaderKey.get(assets), lit: false, shadow_cascades: config.shadow_cascades }
-                    .get(assets)
+                StandardShaderKey {
+                    material_shader: GridShaderKey.get(assets),
+                    lit: false,
+                    shadow_cascades: config.shadow_cascades,
+                }
+                .get(assets)
             }),
         )
         .spawn(world)
@@ -56,12 +69,12 @@ impl ElementComponent for GridGuide {
     fn render(self: Box<Self>, hooks: &mut ambient_element::Hooks) -> ambient_element::Element {
         let Self { rotation, point } = *self;
 
-        let (game_client, _) = hooks.consume_context::<GameClient>().unwrap();
+        let (client_state, _) = consume_context::<ClientState>(hooks).unwrap();
 
-        let (entity, _) = hooks.use_state_with(|world| {
+        let (entity, _) = use_state_with(hooks, |world| {
             let assets = world.resource(asset_cache());
 
-            let mut state = game_client.game_state.lock();
+            let mut state = client_state.game_state.lock();
             let mat = GridMaterialKey {
                 major: Vec2::splat(1.0 / (GRID_SIZE * 5.0)),
                 minor: Vec2::splat(1.0 / GRID_SIZE),
@@ -74,22 +87,26 @@ impl ElementComponent for GridGuide {
         });
 
         {
-            let game_state = game_client.game_state.clone();
-            hooks.use_spawn(move |_| {
-                Box::new(move |_| {
+            let game_state = client_state.game_state.clone();
+            use_spawn(hooks, move |_| {
+                move |_| {
                     game_state.lock().world.despawn(entity);
-                })
+                }
             });
         }
 
-        hooks.use_effect((rotation, point), |_, &(rotation, point)| {
-            let mut state = game_client.game_state.lock();
+        use_effect(hooks, (rotation, point), |_, &(rotation, point)| {
+            let mut state = client_state.game_state.lock();
             let _euler = rotation.to_euler(EulerRot::YXZ);
 
-            let transform = Mat4::from_scale_rotation_translation(Vec3::splat(BLUEBOARD_SIZE), rotation, point);
-            state.world.set(entity, local_to_world(), transform).expect("Entity was despawned");
+            let transform =
+                Mat4::from_scale_rotation_translation(Vec3::splat(BLUEBOARD_SIZE), rotation, point);
+            state
+                .world
+                .set(entity, local_to_world(), transform)
+                .expect("Entity was despawned");
 
-            Box::new(|_| {})
+            |_| {}
         });
 
         Element::new()
@@ -107,27 +124,33 @@ impl ElementComponent for AxisGuide {
     fn render(self: Box<Self>, hooks: &mut ambient_element::Hooks) -> ambient_element::Element {
         let Self { axis, point } = *self;
 
-        let (game_client, _) = hooks.consume_context::<GameClient>().unwrap();
+        let (client_state, _) = consume_context::<ClientState>(hooks).unwrap();
 
-        let (entity, _) = hooks.use_state_with(|world| {
-            let mut state = game_client.game_state.lock();
+        let (entity, _) = use_state_with(hooks, |world| {
+            let mut state = client_state.game_state.lock();
             let assets = world.resource(asset_cache());
 
-            let mat = GridMaterialKey { major: vec2(0.0, 0.2), minor: vec2(0.0, 2.0), line_width: 0.2, size: BLUEBOARD_SIZE }.get(assets);
+            let mat = GridMaterialKey {
+                major: vec2(0.0, 0.2),
+                minor: vec2(0.0, 2.0),
+                line_width: 0.2,
+                size: BLUEBOARD_SIZE,
+            }
+            .get(assets);
 
             spawn_entity(&mut state.world, mat)
         });
 
         {
-            let game_state = game_client.game_state.clone();
-            hooks.use_spawn(move |_| {
-                Box::new(move |_| {
+            let game_state = client_state.game_state.clone();
+            use_spawn(hooks, move |_| {
+                move |_| {
                     game_state.lock().world.despawn(entity);
-                })
+                }
             });
         }
 
-        let mut state = game_client.game_state.lock();
+        let mut state = client_state.game_state.lock();
 
         assert!(axis.is_normalized(), "axis: {axis}");
         let view = state.view().unwrap_or_default();
@@ -146,9 +169,16 @@ impl ElementComponent for AxisGuide {
 
         let billboard = Quat::from_rotation_arc(tangent, to_camera);
 
-        let transform = Mat4::from_scale_rotation_translation(vec3(LINE_WIDTH, BLUEBOARD_SIZE, BLUEBOARD_SIZE), billboard * rot, point);
+        let transform = Mat4::from_scale_rotation_translation(
+            vec3(LINE_WIDTH, BLUEBOARD_SIZE, BLUEBOARD_SIZE),
+            billboard * rot,
+            point,
+        );
 
-        state.world.set(entity, local_to_world(), transform).expect("Entity was despawned");
+        state
+            .world
+            .set(entity, local_to_world(), transform)
+            .expect("Entity was despawned");
 
         Element::new()
     }

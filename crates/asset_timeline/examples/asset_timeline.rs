@@ -3,12 +3,14 @@ use std::{sync::Arc, time::Duration};
 use ambient_app::{App, AppBuilder};
 use ambient_asset_timeline::LocalAssetTimelineVisualizer;
 use ambient_cameras::UICamera;
-use ambient_core::{asset_cache, camera::active_camera, runtime};
+use ambient_core::{asset_cache, runtime};
 use ambient_ecs::World;
 use ambient_element::{ElementComponentExt, Group};
-use ambient_std::asset_cache::{AssetCache, AssetKeepalive, AsyncAssetKey, AsyncAssetKeyExt};
+use ambient_native_std::asset_cache::{
+    AssetCache, AssetKeepalive, AsyncAssetKey, AsyncAssetKeyExt,
+};
 use ambient_sys::task::JoinHandle;
-use ambient_ui::{Button, FocusRoot, WindowSized};
+use ambient_ui_native::{Button, WindowSized};
 use async_trait::async_trait;
 
 #[derive(PartialEq, Eq, Debug)]
@@ -69,7 +71,7 @@ fn load_asset_no_keepalive(world: &mut World) -> JoinHandle<()> {
     let assets = world.resource(asset_cache()).clone();
     world.resource(runtime()).spawn(async move {
         let asset = NoKeepaliveKey.get(&assets).await;
-        tracing::info!("Finished loading asset");
+        tracing::debug!("Finished loading asset");
         tokio::time::sleep(Duration::from_secs(5)).await;
         drop(asset);
     })
@@ -87,8 +89,8 @@ async fn init(app: &mut App) {
     let world = &mut app.world;
     // load_model(world);
     Group(vec![
-        UICamera.el().set(active_camera(), 0.),
-        FocusRoot(vec![WindowSized(vec![
+        UICamera.el(),
+        WindowSized(vec![
             Button::new("Load asset", |world| {
                 load_asset(world);
             })
@@ -98,10 +100,13 @@ async fn init(app: &mut App) {
                 load_asset_no_keepalive(world);
             })
             .el(),
-            Button::new("Load and abort asset (no keepalive)", load_and_abort_asset_no_keepalive).el(),
+            Button::new(
+                "Load and abort asset (no keepalive)",
+                load_and_abort_asset_no_keepalive,
+            )
+            .el(),
             LocalAssetTimelineVisualizer.el(),
         ])
-        .el()])
         .el(),
     ])
     .el()

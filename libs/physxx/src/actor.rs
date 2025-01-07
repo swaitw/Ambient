@@ -1,11 +1,13 @@
 use std::{
-    ffi::{c_void, CStr, CString}, ptr::null_mut
+    ffi::{c_void, CStr, CString},
+    ptr::null_mut,
 };
 
 use glam::Vec3;
 
 use crate::{
-    to_glam_vec3, to_physx_vec3, AsPxBase, PxBaseRef, PxConstraintRef, PxGeometry, PxMaterial, PxPhysicsRef, PxSceneRef, PxShape, PxTransform, PxUserData
+    to_glam_vec3, to_physx_vec3, AsPxBase, PxBaseRef, PxConstraintRef, PxGeometry, PxMaterial,
+    PxPhysicsRef, PxSceneRef, PxShape, PxTransform, PxUserData,
 };
 
 pub trait AsPxActor: Sync + Send + AsPxBase {
@@ -51,7 +53,14 @@ impl<T: AsPxActor + 'static> PxActor for T {
         unsafe { physx_sys::PxActor_setActorFlag_mut(self.as_actor().0, flag.bits, value) }
     }
     fn set_actor_flags(&self, flags: PxActorFlag) {
-        unsafe { physx_sys::PxActor_setActorFlags_mut(self.as_actor().0, physx_sys::PxActorFlags { mBits: flags.bits as u8 }) }
+        unsafe {
+            physx_sys::PxActor_setActorFlags_mut(
+                self.as_actor().0,
+                physx_sys::PxActorFlags {
+                    mBits: flags.bits as u8,
+                },
+            )
+        }
     }
 
     fn get_world_bounds(&self, inflation: f32) -> (Vec3, Vec3) {
@@ -60,7 +69,7 @@ impl<T: AsPxActor + 'static> PxActor for T {
     }
     fn get_name(&self) -> String {
         unsafe {
-            let p = physx_sys::PxActor_getName(self.as_actor().0);
+            let p = physx_sys::PxActor_getName(self.as_actor().0) as *const std::ffi::c_char;
             CStr::from_ptr(p).to_str().unwrap().to_string()
         }
     }
@@ -103,6 +112,9 @@ pub trait PxRigidActor {
     fn detach_shape(&self, shape: &PxShape, wake_on_lost_touch: bool);
     fn get_nb_shapes(&self) -> u32;
     fn get_shapes(&self) -> Vec<PxShape>;
+    /// This returns a list of shapes, but it doesn't increment the refcount for each shape. This means
+    /// that the shapes cannot be stored, and will only be valid as long as the rigid actor is valid.
+    fn borrow_shapes(&self) -> Vec<PxShape>;
     fn set_global_pose(&self, pose: &PxTransform, autowake: bool);
     fn get_global_pose(&self) -> PxTransform;
     fn get_constraints(&self) -> Vec<PxConstraintRef>;
@@ -113,26 +125,37 @@ impl<T: AsPxRigidActor + 'static> PxRigidActor for T {
         unsafe { physx_sys::PxRigidActor_attachShape_mut(self.as_rigid_actor().0, shape.0) }
     }
     fn detach_shape(&self, shape: &PxShape, wake_on_lost_touch: bool) {
-        unsafe { physx_sys::PxRigidActor_detachShape_mut(self.as_rigid_actor().0, shape.0, wake_on_lost_touch) }
+        unsafe {
+            physx_sys::PxRigidActor_detachShape_mut(
+                self.as_rigid_actor().0,
+                shape.0,
+                wake_on_lost_touch,
+            )
+        }
     }
     fn get_nb_shapes(&self) -> u32 {
         unsafe { physx_sys::PxRigidActor_getNbShapes(self.as_rigid_actor().0) }
     }
-    fn get_shapes(&self) -> Vec<PxShape> {
+    fn borrow_shapes(&self) -> Vec<PxShape> {
         let capacity = self.get_nb_shapes();
         let mut buffer: Vec<*mut physx_sys::PxShape> = Vec::with_capacity(capacity as usize);
         unsafe {
-            let len = physx_sys::PxRigidActor_getShapes(self.as_rigid_actor().0, buffer.as_mut_ptr() as *mut *mut _, capacity, 0);
+            let len = physx_sys::PxRigidActor_getShapes(
+                self.as_rigid_actor().0,
+                buffer.as_mut_ptr(),
+                capacity,
+                0,
+            );
             buffer.set_len(len as usize);
         }
-        buffer
-            .into_iter()
-            .map(|x| {
-                let mut s = PxShape(x);
-                s.acquire_reference();
-                s
-            })
-            .collect()
+        buffer.into_iter().map(|x| PxShape(x, 0)).collect()
+    }
+    fn get_shapes(&self) -> Vec<PxShape> {
+        let mut shapes = self.borrow_shapes();
+        for shape in &mut shapes {
+            shape.acquire_reference();
+        }
+        shapes
     }
     fn set_global_pose(&self, pose: &PxTransform, autowake: bool) {
         unsafe {
@@ -146,7 +169,12 @@ impl<T: AsPxRigidActor + 'static> PxRigidActor for T {
         unsafe {
             let count = physx_sys::PxRigidActor_getNbConstraints(self.as_rigid_actor().0);
             let mut buff = vec![null_mut(); count as usize];
-            physx_sys::PxRigidActor_getConstraints(self.as_rigid_actor().0, buff.as_mut_ptr() as *mut *mut _, count, 0);
+            physx_sys::PxRigidActor_getConstraints(
+                self.as_rigid_actor().0,
+                buff.as_mut_ptr(),
+                count,
+                0,
+            );
             buff.into_iter().map(PxConstraintRef).collect()
         }
     }
@@ -229,7 +257,13 @@ pub trait PxRigidBody {
     fn set_mass(&self, mass: f32);
     fn get_velocity_at_pos(&self, pos: Vec3) -> Vec3;
     fn add_force(&self, force: Vec3, mode: Option<PxForceMode>, autowake: Option<bool>);
-    fn add_force_at_pos(&self, force: Vec3, pos: Vec3, mode: Option<PxForceMode>, wakeup: Option<bool>);
+    fn add_force_at_pos(
+        &self,
+        force: Vec3,
+        pos: Vec3,
+        mode: Option<PxForceMode>,
+        wakeup: Option<bool>,
+    );
     fn get_rigid_body_flags(&self) -> PxRigidBodyFlag;
     fn set_rigid_body_flag(&self, flag: PxRigidBodyFlag, value: bool);
     fn set_rigid_body_flags(&self, flags: PxRigidBodyFlag);
@@ -246,7 +280,9 @@ impl<T: AsPxRigidBody + ?Sized> PxRigidBody for T {
                 self.as_rigid_body().0,
                 shape_densities.as_ptr(),
                 shape_densities.len() as u32,
-                mass_local_pose.map(|x| &to_physx_vec3(x) as *const physx_sys::PxVec3).unwrap_or(null_mut()),
+                mass_local_pose
+                    .map(|x| &to_physx_vec3(x) as *const physx_sys::PxVec3)
+                    .unwrap_or(null_mut()),
                 include_non_sim_shapes.unwrap_or(false),
             )
         }
@@ -261,7 +297,9 @@ impl<T: AsPxRigidBody + ?Sized> PxRigidBody for T {
             physx_sys::PxRigidBodyExt_updateMassAndInertia_mut_1(
                 self.as_rigid_body().0,
                 density,
-                mass_local_pose.map(|x| &to_physx_vec3(x) as *const physx_sys::PxVec3).unwrap_or(null_mut()),
+                mass_local_pose
+                    .map(|x| &to_physx_vec3(x) as *const physx_sys::PxVec3)
+                    .unwrap_or(null_mut()),
                 include_non_sim_shapes.unwrap_or(false),
             )
         }
@@ -270,13 +308,25 @@ impl<T: AsPxRigidBody + ?Sized> PxRigidBody for T {
         to_glam_vec3(&unsafe { physx_sys::PxRigidBody_getLinearVelocity(self.as_rigid_body().0) })
     }
     fn set_linear_velocity(&self, value: Vec3, autoawake: bool) {
-        unsafe { physx_sys::PxRigidBody_setLinearVelocity_mut(self.as_rigid_body().0, &to_physx_vec3(value), autoawake) }
+        unsafe {
+            physx_sys::PxRigidBody_setLinearVelocity_mut(
+                self.as_rigid_body().0,
+                &to_physx_vec3(value),
+                autoawake,
+            )
+        }
     }
     fn get_angular_velocity(&self) -> Vec3 {
         to_glam_vec3(&unsafe { physx_sys::PxRigidBody_getAngularVelocity(self.as_rigid_body().0) })
     }
     fn set_angular_velocity(&self, value: Vec3, autoawake: bool) {
-        unsafe { physx_sys::PxRigidBody_setAngularVelocity_mut(self.as_rigid_body().0, &to_physx_vec3(value), autoawake) }
+        unsafe {
+            physx_sys::PxRigidBody_setAngularVelocity_mut(
+                self.as_rigid_body().0,
+                &to_physx_vec3(value),
+                autoawake,
+            )
+        }
     }
     fn get_mass(&self) -> f32 {
         unsafe { physx_sys::PxRigidBody_getMass(self.as_rigid_body().0) }
@@ -285,7 +335,12 @@ impl<T: AsPxRigidBody + ?Sized> PxRigidBody for T {
         unsafe { physx_sys::PxRigidBody_setMass_mut(self.as_rigid_body().0, mass) }
     }
     fn get_velocity_at_pos(&self, pos: Vec3) -> Vec3 {
-        unsafe { to_glam_vec3(&physx_sys::PxRigidBodyExt_getVelocityAtPos_mut(self.as_rigid_body().0, &to_physx_vec3(pos))) }
+        unsafe {
+            to_glam_vec3(&physx_sys::PxRigidBodyExt_getVelocityAtPos_mut(
+                self.as_rigid_body().0,
+                &to_physx_vec3(pos),
+            ))
+        }
     }
     fn add_force(&self, force: Vec3, mode: Option<PxForceMode>, wakeup: Option<bool>) {
         unsafe {
@@ -297,7 +352,13 @@ impl<T: AsPxRigidBody + ?Sized> PxRigidBody for T {
             )
         }
     }
-    fn add_force_at_pos(&self, force: Vec3, pos: Vec3, mode: Option<PxForceMode>, wakeup: Option<bool>) {
+    fn add_force_at_pos(
+        &self,
+        force: Vec3,
+        pos: Vec3,
+        mode: Option<PxForceMode>,
+        wakeup: Option<bool>,
+    ) {
         unsafe {
             physx_sys::PxRigidBodyExt_addForceAtPos_mut(
                 self.as_rigid_body().0,
@@ -309,14 +370,26 @@ impl<T: AsPxRigidBody + ?Sized> PxRigidBody for T {
         }
     }
     fn get_rigid_body_flags(&self) -> PxRigidBodyFlag {
-        unsafe { PxRigidBodyFlag::from_bits(physx_sys::PxRigidBody_getRigidBodyFlags(self.as_rigid_body().0).mBits as u32).unwrap() }
+        unsafe {
+            PxRigidBodyFlag::from_bits(
+                physx_sys::PxRigidBody_getRigidBodyFlags(self.as_rigid_body().0).mBits as u32,
+            )
+            .unwrap()
+        }
     }
     fn set_rigid_body_flag(&self, flag: PxRigidBodyFlag, value: bool) {
-        unsafe { physx_sys::PxRigidBody_setRigidBodyFlag_mut(self.as_rigid_body().0, flag.bits, value) }
+        unsafe {
+            physx_sys::PxRigidBody_setRigidBodyFlag_mut(self.as_rigid_body().0, flag.bits, value)
+        }
     }
     fn set_rigid_body_flags(&self, flags: PxRigidBodyFlag) {
         unsafe {
-            physx_sys::PxRigidBody_setRigidBodyFlags_mut(self.as_rigid_body().0, physx_sys::PxRigidBodyFlags { mBits: flags.bits as u8 })
+            physx_sys::PxRigidBody_setRigidBodyFlags_mut(
+                self.as_rigid_body().0,
+                physx_sys::PxRigidBodyFlags {
+                    mBits: flags.bits as u8,
+                },
+            )
         }
     }
 }
@@ -361,7 +434,14 @@ impl PxRigidDynamicRef {
         shape_offset: &PxTransform,
     ) -> Self {
         Self(unsafe {
-            physx_sys::phys_PxCreateDynamic(physics.0, &transform.0, geometry.as_geometry_ptr(), material.0, density, &shape_offset.0)
+            physx_sys::phys_PxCreateDynamic(
+                physics.0,
+                &transform.0,
+                geometry.as_geometry_ptr(),
+                material.0,
+                density,
+                &shape_offset.0,
+            )
         })
     }
 }
@@ -370,7 +450,9 @@ impl PxRigidDynamicRef {
         unsafe { physx_sys::PxRigidDynamic_wakeUp_mut(self.0) }
     }
     pub fn set_kinematic_target(&self, destination: &PxTransform) {
-        unsafe { physx_sys::PxRigidDynamic_setKinematicTarget_mut(self.0, &destination.0); }
+        unsafe {
+            physx_sys::PxRigidDynamic_setKinematicTarget_mut(self.0, &destination.0);
+        }
     }
 }
 impl AsPxBase for PxRigidDynamicRef {
@@ -409,11 +491,28 @@ impl PxRigidStaticRef {
         material: &PxMaterial,
         shape_transform: &PxTransform,
     ) -> Self {
-        Self(unsafe { physx_sys::phys_PxCreateStatic(physics.0, &transform.0, geometry.as_geometry_ptr(), material.0, &shape_transform.0) })
-    }
-    pub fn new_plane(physics: PxPhysicsRef, normal: glam::Vec3, distance: f32, material: &PxMaterial) -> Self {
         Self(unsafe {
-            physx_sys::phys_PxCreatePlane(physics.0, &physx_sys::PxPlane_new_1(normal.x, normal.y, normal.z, distance), material.0)
+            physx_sys::phys_PxCreateStatic(
+                physics.0,
+                &transform.0,
+                geometry.as_geometry_ptr(),
+                material.0,
+                &shape_transform.0,
+            )
+        })
+    }
+    pub fn new_plane(
+        physics: PxPhysicsRef,
+        normal: glam::Vec3,
+        distance: f32,
+        material: &PxMaterial,
+    ) -> Self {
+        Self(unsafe {
+            physx_sys::phys_PxCreatePlane(
+                physics.0,
+                &physx_sys::PxPlane_new_1(normal.x, normal.y, normal.z, distance),
+                material.0,
+            )
         })
     }
 }

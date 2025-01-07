@@ -3,21 +3,23 @@ use std::{future::Future, sync::Arc, time::Duration};
 use ambient_cameras::assets_camera_systems;
 pub use ambient_core::gpu;
 use ambient_core::{
-    app_start_time, asset_cache,
+    asset_cache,
     async_ecs::async_ecs_systems,
     bounding::bounding_systems,
     camera::camera_systems,
     frame_index,
-    gpu_ecs::{gpu_world, GpuWorld, GpuWorldSyncEvent, GpuWorldUpdate},
-    hierarchy::dump_world_hierarchy_to_tmp_file,
-    remove_at_time_system, runtime, time,
+    hierarchy::dump_world_hierarchy_to_user,
+    name, performance_samples, refcount_system, remove_at_time_system, runtime, timing,
     transform::TransformSystem,
-    window::{cursor_position, get_window_sizes, window_logical_size, window_physical_size, window_scale_factor, WindowCtl},
-    RuntimeKey, TimeResourcesSystem,
+    window::{
+        cursor_position, get_window_sizes, window_logical_size, window_physical_size,
+        window_scale_factor, ExitStatus, WindowCtl,
+    },
+    ClientTimeResourcesSystem, PerformanceSample, RuntimeKey,
 };
 use ambient_ecs::{
-    components, world_events, Debuggable, DynSystem, Entity, FrameEvent, MakeDefault, MaybeResource, System, SystemGroup, World,
-    WorldEventsSystem,
+    components, generated::ui::components::focus, world_events, Debuggable, DynSystem, Entity,
+    FrameEvent, MakeDefault, MaybeResource, System, SystemGroup, World, WorldEventsSystem,
 };
 use ambient_element::ambient_system;
 use ambient_gizmos::{gizmos, Gizmos};
@@ -25,22 +27,25 @@ use ambient_gpu::{
     gpu::{Gpu, GpuKey},
     mesh_buffer::MeshBufferKey,
 };
-use ambient_renderer::lod::lod_system;
-use ambient_std::{
+use ambient_gpu_ecs::{gpu_world, GpuWorld, GpuWorldSyncEvent, GpuWorldUpdate};
+use ambient_native_std::{
     asset_cache::{AssetCache, SyncAssetKeyExt},
     fps_counter::{FpsCounter, FpsSample},
 };
-use ambient_sys::{task::RuntimeHandle, time::SystemTime};
-use glam::{uvec2, vec2, UVec2, Vec2};
+use ambient_procedurals::{procedural_storage, ProceduralStorage};
+use ambient_renderer::lod::lod_system;
+use ambient_settings::SettingsKey;
+use ambient_sys::{task::RuntimeHandle, time::Instant};
+
+use glam::{uvec2, vec2, IVec2, UVec2, Vec2};
 use parking_lot::Mutex;
-use renderers::{examples_renderer, ui_renderer, UIRender};
+use renderers::{main_renderer, ui_renderer, MainRenderer, UiRenderer};
 use winit::{
+    dpi::PhysicalPosition,
     event::{ElementState, Event, KeyboardInput, ModifiersState, VirtualKeyCode, WindowEvent},
     event_loop::{ControlFlow, EventLoop},
-    window::{Window, WindowBuilder},
+    window::{CursorGrabMode, Fullscreen, Window, WindowBuilder},
 };
-
-use crate::renderers::ExamplesRender;
 
 mod renderers;
 
@@ -52,35 +57,38 @@ components!("app", {
     @[MakeDefault[default_title], Debuggable, MaybeResource]
     window_title: String,
     fps_stats: FpsSample,
+
 });
 
 pub fn init_all_components() {
     ambient_ecs::init_components();
     ambient_core::init_all_components();
     ambient_element::init_components();
-    ambient_animation::init_components();
+    ambient_animation::init_all_components();
     ambient_gizmos::init_components();
     ambient_cameras::init_all_components();
     init_components();
     ambient_renderer::init_all_components();
-    ambient_ui::init_all_components();
+    ambient_ui_native::init_all_components();
     ambient_input::init_all_components();
     ambient_model::init_components();
     ambient_cameras::init_all_components();
     renderers::init_components();
+    ambient_procedurals::init_components();
+    ambient_timings::init_components();
 }
 
-pub fn gpu_world_sync_systems() -> SystemGroup<GpuWorldSyncEvent> {
+pub fn gpu_world_sync_systems(gpu: Arc<Gpu>) -> SystemGroup<GpuWorldSyncEvent> {
     SystemGroup::new(
         "gpu_world",
         vec![
             // Note: All Gpu sync systems must run immediately after GpuWorldUpdate, as that's the only time we know
             // the layout of the GpuWorld is correct
-            Box::new(GpuWorldUpdate),
-            Box::new(ambient_core::transform::transform_gpu_systems()),
-            Box::new(ambient_renderer::gpu_world_systems()),
-            Box::new(ambient_core::bounding::gpu_world_systems()),
-            Box::new(ambient_ui::layout::gpu_world_systems()),
+            Box::new(GpuWorldUpdate(gpu.clone())),
+            Box::new(ambient_core::transform::transform_gpu_systems(gpu.clone())),
+            Box::new(ambient_renderer::gpu_world_systems(gpu.clone())),
+            Box::new(ambient_core::bounding::gpu_world_systems(gpu.clone())),
+            Box::new(ambient_ui_native::layout::gpu_world_systems(gpu.clone())),
         ],
     )
 }
@@ -89,21 +97,36 @@ pub fn world_instance_systems(full: bool) -> SystemGroup {
     SystemGroup::new(
         "world_instance",
         vec![
-            Box::new(TimeResourcesSystem::new()),
+            Box::new(ambient_timings::on_started_timing_system()),
+            Box::new(ClientTimeResourcesSystem::new()),
             Box::new(async_ecs_systems()),
             remove_at_time_system(),
+            refcount_system(),
+            Box::new(ambient_core::hierarchy::systems()),
             Box::new(WorldEventsSystem),
-            if full { Box::new(ambient_input::picking::frame_systems()) } else { Box::new(DummySystem) },
+            Box::new(ambient_focus::systems()),
+            if full {
+                Box::new(ambient_input::picking::frame_systems())
+            } else {
+                Box::new(DummySystem)
+            },
             Box::new(lod_system()),
             Box::new(ambient_renderer::systems()),
             Box::new(ambient_system()),
-            if full { Box::new(ambient_ui::systems()) } else { Box::new(DummySystem) },
+            if full {
+                Box::new(ambient_ui_native::systems())
+            } else {
+                Box::new(DummySystem)
+            },
             Box::new(ambient_model::model_systems()),
             Box::new(ambient_animation::animation_systems()),
             Box::new(TransformSystem::new()),
             Box::new(ambient_renderer::skinning::skinning_systems()),
             Box::new(bounding_systems()),
             Box::new(camera_systems()),
+            Box::new(ambient_procedurals::client_systems()),
+            Box::<ambient_timings::ProcessTimingEventsSystem>::default(),
+            Box::new(ambient_timings::on_finished_timing_system()),
         ],
     )
 }
@@ -116,6 +139,7 @@ pub struct AppResources {
     window_physical_size: UVec2,
     window_logical_size: UVec2,
     window_scale_factor: f64,
+    timings_reporter: timing::Reporter,
 }
 
 impl AppResources {
@@ -128,46 +152,64 @@ impl AppResources {
             window_physical_size: *world.resource(ambient_core::window::window_physical_size()),
             window_logical_size: *world.resource(ambient_core::window::window_logical_size()),
             window_scale_factor: *world.resource(ambient_core::window::window_scale_factor()),
+            timings_reporter: world.resource(timing::reporter()).clone(),
         }
     }
 }
 
 pub fn world_instance_resources(resources: AppResources) -> Entity {
-    let current_time = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap();
     Entity::new()
+        .with(name(), "Resources".to_string())
         .with(self::gpu(), resources.gpu.clone())
         .with(gizmos(), Gizmos::new())
         .with(self::runtime(), resources.runtime)
         .with(self::window_title(), "".to_string())
         .with(self::fps_stats(), FpsSample::default())
+        .with(self::performance_samples(), Vec::new())
         .with(self::asset_cache(), resources.assets.clone())
-        .with_default(world_events())
+        .with(world_events(), Default::default())
         .with(frame_index(), 0_usize)
         .with(ambient_core::window::cursor_position(), Vec2::ZERO)
-        .with(ambient_core::app_start_time(), current_time)
-        .with(ambient_core::time(), current_time)
-        .with(ambient_core::dtime(), 0.)
-        .with(gpu_world(), GpuWorld::new_arced(resources.assets))
+        .with(
+            gpu_world(),
+            GpuWorld::new_arced(&resources.gpu, resources.assets),
+        )
+        .with_merge(ambient_core::time_resources_start(Duration::ZERO))
+        .with_merge(ambient_input::resources())
         .with_merge(ambient_input::picking::resources())
         .with_merge(ambient_core::async_ecs::async_ecs_resources())
-        .with(ambient_core::window::window_physical_size(), resources.window_physical_size)
-        .with(ambient_core::window::window_logical_size(), resources.window_logical_size)
-        .with(ambient_core::window::window_scale_factor(), resources.window_scale_factor)
+        .with(
+            ambient_core::window::window_physical_size(),
+            resources.window_physical_size,
+        )
+        .with(
+            ambient_core::window::window_logical_size(),
+            resources.window_logical_size,
+        )
+        .with(
+            ambient_core::window::window_scale_factor(),
+            resources.window_scale_factor,
+        )
         .with(ambient_core::window::window_ctl(), resources.ctl_tx)
-}
-
-pub fn get_time_since_app_start(world: &World) -> Duration {
-    *world.resource(time()) - *world.resource(app_start_time())
+        .with(procedural_storage(), ProceduralStorage::new())
+        .with(focus(), Default::default())
+        .with(timing::reporter(), resources.timings_reporter)
+        .with(ambient_timings::samples(), Default::default())
 }
 
 pub struct AppBuilder {
     pub event_loop: Option<EventLoop<()>>,
-    pub window_builder: Option<WindowBuilder>,
     pub asset_cache: Option<AssetCache>,
     pub ui_renderer: bool,
     pub main_renderer: bool,
     pub examples_systems: bool,
     pub headless: Option<UVec2>,
+    pub update_title_with_fps_stats: bool,
+    ctl: Option<(flume::Sender<WindowCtl>, flume::Receiver<WindowCtl>)>,
+    pub window_position_override: Option<IVec2>,
+    pub window_size_override: Option<UVec2>,
+    #[cfg(target_os = "unknown")]
+    pub parent_element: Option<web_sys::HtmlElement>,
 }
 
 pub trait AsyncInit<'a> {
@@ -191,30 +233,33 @@ impl AppBuilder {
     pub fn new() -> Self {
         Self {
             event_loop: None,
-            window_builder: None,
             asset_cache: None,
             ui_renderer: false,
             main_renderer: true,
             examples_systems: false,
             headless: None,
+            update_title_with_fps_stats: true,
+            ctl: None,
+            window_position_override: None,
+            window_size_override: None,
+            #[cfg(target_os = "unknown")]
+            parent_element: None,
         }
     }
     pub fn simple() -> Self {
         Self::new().examples_systems(true)
     }
     pub fn simple_ui() -> Self {
-        Self::new().ui_renderer(true).main_renderer(false).examples_systems(true)
+        Self::new()
+            .ui_renderer(true)
+            .main_renderer(false)
+            .examples_systems(true)
     }
     pub fn simple_dual() -> Self {
         Self::new().ui_renderer(true).main_renderer(true)
     }
     pub fn with_event_loop(mut self, event_loop: EventLoop<()>) -> Self {
         self.event_loop = Some(event_loop);
-        self
-    }
-
-    pub fn with_window_builder(mut self, window_builder: WindowBuilder) -> Self {
-        self.window_builder = Some(window_builder);
         self
     }
 
@@ -243,54 +288,215 @@ impl AppBuilder {
         self
     }
 
+    pub fn update_title_with_fps_stats(mut self, value: bool) -> Self {
+        self.update_title_with_fps_stats = value;
+        self
+    }
+
+    pub fn with_window_position_override(mut self, position: IVec2) -> Self {
+        self.window_position_override = Some(position);
+        self
+    }
+
+    pub fn with_window_size_override(mut self, size: UVec2) -> Self {
+        self.window_size_override = Some(size);
+        self
+    }
+
+    #[cfg(target_os = "unknown")]
+    pub fn parent_element(mut self, value: Option<web_sys::HtmlElement>) -> Self {
+        self.parent_element = value;
+        self
+    }
+
+    pub fn window_ctl(
+        mut self,
+        ctl_tx: flume::Sender<WindowCtl>,
+        ctl_rx: flume::Receiver<WindowCtl>,
+    ) -> Self {
+        self.ctl = Some((ctl_tx, ctl_rx));
+
+        self
+    }
+
     pub async fn build(self) -> anyhow::Result<App> {
         crate::init_all_components();
+
+        let runtime = RuntimeHandle::current();
+
+        let assets = self
+            .asset_cache
+            .unwrap_or_else(|| AssetCache::new(runtime.clone()));
+
+        let settings = SettingsKey.get(&assets);
+
         let (window, event_loop) = if self.headless.is_some() {
             (None, None)
         } else {
-            let event_loop = self.event_loop.unwrap_or_else(EventLoop::new);
-            let window = self.window_builder.unwrap_or_default();
+            let event_loop = self.event_loop.unwrap_or_default();
+            let window = WindowBuilder::new().with_inner_size(winit::dpi::LogicalSize {
+                width: settings.render.resolution().0,
+                height: settings.render.resolution().1,
+            });
+            let window = if let Some(position) = self.window_position_override {
+                window.with_position(winit::dpi::LogicalPosition {
+                    x: position.x,
+                    y: position.y,
+                })
+            } else {
+                window
+            };
+            let window = if let Some(size) = self.window_size_override {
+                window.with_inner_size(winit::dpi::LogicalSize {
+                    width: size.x,
+                    height: size.y,
+                })
+            } else {
+                window
+            };
             let window = Arc::new(window.build(&event_loop).unwrap());
             (Some(window), Some(event_loop))
         };
 
+        let (cursor_lock_tx, cursor_lock_rx) = flume::unbounded::<bool>();
+
+        // This isn't necessary on native
+        #[cfg(not(target_os = "unknown"))]
+        let _ = cursor_lock_tx;
+
+        #[cfg(target_os = "unknown")]
+        let mut drop_handles: Vec<Box<dyn std::fmt::Debug>> = Vec::new();
+
         #[cfg(target_os = "unknown")]
         // Insert a canvas element for the window to attach to
-        if let Some(window) = &window {
+        let force_resize_event_rx = {
             use winit::platform::web::WindowExtWebSys;
 
+            let window = window.as_ref().expect("this should not be possible");
             let canvas = window.canvas();
+            let document = web_sys::window().unwrap().document().unwrap();
 
-            let window = web_sys::window().unwrap();
-            let document = window.document().unwrap();
-            let body = document.body().unwrap();
+            let target = self
+                .parent_element
+                .unwrap_or_else(|| document.body().unwrap());
 
-            // Set a background color for the canvas to make it easier to tell where the canvas is for debugging purposes.
-            canvas.style().set_css_text("background-color: crimson;");
-            body.append_child(&canvas).unwrap();
-        }
+            use wasm_bindgen::prelude::*;
+
+            let on_context_menu = Closure::<dyn Fn(_)>::new(|event: web_sys::MouseEvent| {
+                event.prevent_default();
+            });
+
+            canvas.set_oncontextmenu(Some(on_context_menu.as_ref().unchecked_ref()));
+            drop_handles.push(Box::new(on_context_menu));
+
+            // HACK: Listen for pointer lock change here to ensure that the guest
+            // is notified that the pointer is no longer locked, so that they can
+            // update their state accordingly.
+            //
+            // It would be nice to move this into the input systems, but I don't
+            // want to leak too much information about the running environment
+            // into other code.
+            let on_pointer_lock_change = Closure::<dyn Fn()>::new({
+                let canvas = canvas.clone();
+                let document = document.clone();
+                move || {
+                    let is_locked =
+                        document.pointer_lock_element().as_ref() == Some(canvas.as_ref());
+
+                    let _ = cursor_lock_tx.send(is_locked);
+                }
+            });
+            document
+                .add_event_listener_with_callback_and_bool(
+                    "pointerlockchange",
+                    on_pointer_lock_change.as_ref().unchecked_ref(),
+                    false,
+                )
+                .unwrap();
+            drop_handles.push(Box::new(on_pointer_lock_change));
+
+            // Updates the canvas to match the target size. Returns the target size/max size, and the real size.
+            fn update_canvas_size(
+                target: &web_sys::Element,
+                canvas: &web_sys::HtmlCanvasElement,
+            ) -> ((i32, i32), (u32, u32)) {
+                // Get the screen's available width and height
+                let window = web_sys::window().unwrap();
+
+                let max_width = target.client_width();
+                let max_height = target.client_height();
+
+                // Get device pixel ratio
+                let device_pixel_ratio = window.device_pixel_ratio();
+
+                // Calculate the real dimensions of the canvas considering the device pixel ratio
+                let real_width = (max_width as f64 * device_pixel_ratio) as u32;
+                let real_height = (max_height as f64 * device_pixel_ratio) as u32;
+
+                // Set the canvas dimensions using the real dimensions
+                canvas.set_width(real_width);
+                canvas.set_height(real_height);
+
+                // Set a background color for the canvas to make it easier to tell where the canvas is for debugging purposes.
+                // Use the maximum available width and height as the canvas dimensions.
+                canvas.style().set_css_text(&format!(
+                    "background-color: black; width: {}px; height: {}px; z-index: 50",
+                    max_width, max_height
+                ));
+
+                ((max_width, max_height), (real_width, real_height))
+            }
+
+            let ((max_width, max_height), _) = update_canvas_size(&target, &canvas);
+
+            // HACK(philpax): hackfix for https://github.com/AmbientRun/Ambient/issues/923
+            // remove after https://github.com/AmbientRun/Ambient/issues/1096
+            let (force_resize_event_tx, force_resize_event_rx) = flume::unbounded();
+            let resize_callback = Closure::<dyn Fn()>::new({
+                let canvas = canvas.clone();
+                let target = target.clone();
+                move || {
+                    let (_, real_size) = update_canvas_size(&target, &canvas);
+                    let _ = force_resize_event_tx.send(real_size);
+                }
+            });
+            let resize_observer =
+                web_sys::ResizeObserver::new(resize_callback.as_ref().unchecked_ref()).unwrap();
+            resize_observer.observe(&target);
+            drop_handles.push(Box::new(resize_callback));
+            drop_handles.push(Box::new(resize_observer));
+
+            target.append_child(&canvas).unwrap();
+            force_resize_event_rx
+        };
 
         #[cfg(feature = "profile")]
         let puffin_server = {
             let puffin_addr = format!(
                 "0.0.0.0:{}",
-                std::env::var("PUFFIN_PORT").ok().and_then(|port| port.parse::<u16>().ok()).unwrap_or(puffin_http::DEFAULT_PORT)
+                std::env::var("PUFFIN_PORT")
+                    .ok()
+                    .and_then(|port| port.parse::<u16>().ok())
+                    .unwrap_or(puffin_http::DEFAULT_PORT)
             );
-            let server = puffin_http::Server::new(&puffin_addr)?;
-            tracing::debug!("Puffin server running on {}", puffin_addr);
-            puffin::set_scopes_on(true);
-            server
+            match puffin_http::Server::new(&puffin_addr) {
+                Ok(server) => {
+                    tracing::debug!("Puffin server running on {}", puffin_addr);
+                    puffin::set_scopes_on(true);
+                    Some(server)
+                }
+                Err(err) => {
+                    tracing::error!("Failed to start puffin server: {:?}", err);
+                    None
+                }
+            }
         };
 
         #[cfg(not(target_os = "unknown"))]
         let _ = thread_priority::set_current_thread_priority(thread_priority::ThreadPriority::Max);
 
-        let runtime = RuntimeHandle::current();
-
-        let assets = self.asset_cache.unwrap_or_else(|| AssetCache::new(runtime.clone()));
-
-        let mut world = World::new("main_app");
-        let gpu = Arc::new(Gpu::with_config(window.as_deref(), true).await);
+        let mut world = World::new("main_app", ambient_ecs::WorldContext::App);
+        let gpu = Arc::new(Gpu::with_config(window.as_deref(), true, &settings.render).await?);
 
         tracing::debug!("Inserting runtime");
         RuntimeKey.insert(&assets, runtime.clone());
@@ -298,34 +504,46 @@ impl AppBuilder {
         // WindowKey.insert(&assets, window.clone());
 
         tracing::debug!("Inserting app resources");
-        let (ctl_tx, ctl_rx) = flume::unbounded();
+        let (ctl_tx, ctl_rx) = self.ctl.unwrap_or_else(flume::unbounded);
 
-        let (window_physical_size, window_logical_size, window_scale_factor) = if let Some(window) = window.as_ref() {
-            get_window_sizes(window)
-        } else {
-            let headless_size = self.headless.unwrap();
-            (headless_size, headless_size, 1.)
+        let (window_physical_size, window_logical_size, window_scale_factor) =
+            if let Some(window) = window.as_ref() {
+                get_window_sizes(window)
+            } else {
+                let headless_size = self.headless.unwrap();
+                (headless_size, headless_size, 1.)
+            };
+
+        let app_resources = AppResources {
+            gpu: gpu.clone(),
+            runtime: runtime.clone(),
+            assets,
+            ctl_tx,
+            window_physical_size,
+            window_logical_size,
+            window_scale_factor,
+            timings_reporter: Default::default(),
         };
-
-        let app_resources =
-            AppResources { gpu, runtime: runtime.clone(), assets, ctl_tx, window_physical_size, window_logical_size, window_scale_factor };
 
         let resources = world_instance_resources(app_resources);
 
-        world.add_components(world.resource_entity(), resources).unwrap();
+        world
+            .add_components(world.resource_entity(), resources)
+            .unwrap();
         tracing::debug!("Setup renderers");
         if self.ui_renderer || self.main_renderer {
             // let _span = info_span!("setup_renderers").entered();
             if !self.main_renderer {
                 tracing::debug!("Setting up UI renderer");
-                let renderer = Arc::new(Mutex::new(UIRender::new(&mut world)));
+                let renderer = Arc::new(Mutex::new(UiRenderer::new(&mut world)));
                 world.add_resource(ui_renderer(), renderer);
             } else {
-                tracing::debug!("Setting up ExamplesRenderer");
-                let renderer = ExamplesRender::new(&mut world, self.ui_renderer, self.main_renderer);
-                tracing::debug!("Created examples renderer");
+                tracing::debug!("Setting up Main renderer");
+                let renderer =
+                    MainRenderer::new(&gpu, &mut world, self.ui_renderer, self.main_renderer);
+                tracing::debug!("Created main renderer");
                 let renderer = Arc::new(Mutex::new(renderer));
-                world.add_resource(examples_renderer(), renderer);
+                world.add_resource(main_renderer(), renderer);
             }
         }
 
@@ -333,7 +551,12 @@ impl AppBuilder {
 
         let mut window_event_systems = SystemGroup::new(
             "window_event_systems",
-            vec![Box::new(assets_camera_systems()), Box::new(ambient_input::event_systems()), Box::new(renderers::systems())],
+            vec![
+                Box::new(ambient_timings::InputTimingSystem),
+                Box::new(assets_camera_systems()),
+                Box::new(ambient_input::event_systems()),
+                Box::new(renderers::systems()),
+            ],
         );
         if self.examples_systems {
             window_event_systems.add(Box::new(ExamplesSystem));
@@ -343,9 +566,16 @@ impl AppBuilder {
             window_focused: true,
             window,
             runtime,
-            systems: SystemGroup::new("app", vec![Box::new(MeshBufferUpdate), Box::new(world_instance_systems(true))]),
+            systems: SystemGroup::new(
+                "app",
+                vec![
+                    Box::new(MeshBufferUpdate),
+                    Box::new(world_instance_systems(true)),
+                    ambient_input::cursor_lock_system(cursor_lock_rx),
+                ],
+            ),
             world,
-            gpu_world_sync_systems: gpu_world_sync_systems(),
+            gpu_world_sync_systems: gpu_world_sync_systems(gpu.clone()),
             window_event_systems,
             event_loop,
 
@@ -354,13 +584,20 @@ impl AppBuilder {
             _puffin: puffin_server,
             modifiers: Default::default(),
             ctl_rx,
+            current_time: Instant::now(),
+            update_title_with_fps_stats: self.update_title_with_fps_stats,
+            #[cfg(target_os = "unknown")]
+            _drop_handles: drop_handles,
+
+            #[cfg(target_os = "unknown")]
+            force_resize_event_rx,
         })
     }
 
     /// Runs the app by blocking the main thread
     #[cfg(not(target_os = "unknown"))]
     pub fn block_on(self, init: impl for<'x> AsyncInit<'x>) {
-        let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+        let rt = ambient_sys::task::make_native_multithreaded_runtime().unwrap();
 
         rt.block_on(async move {
             let mut app = self.build().await.unwrap();
@@ -372,7 +609,7 @@ impl AppBuilder {
     }
 
     /// Finalizes the app and enters the main loop
-    pub async fn run(self, init: impl FnOnce(&mut App, RuntimeHandle)) {
+    pub async fn run(self, init: impl FnOnce(&mut App, RuntimeHandle)) -> ExitStatus {
         let mut app = self.build().await.unwrap();
         let runtime = app.runtime.clone();
         init(&mut app, runtime);
@@ -380,7 +617,7 @@ impl AppBuilder {
     }
 
     #[inline]
-    pub async fn run_world(self, init: impl FnOnce(&mut World)) {
+    pub async fn run_world(self, init: impl FnOnce(&mut World)) -> ExitStatus {
         self.run(|app, _| init(&mut app.world)).await
     }
 }
@@ -396,10 +633,17 @@ pub struct App {
     event_loop: Option<EventLoop<()>>,
     fps: FpsCounter,
     #[cfg(feature = "profile")]
-    _puffin: puffin_http::Server,
+    _puffin: Option<puffin_http::Server>,
     modifiers: ModifiersState,
 
     window_focused: bool,
+    update_title_with_fps_stats: bool,
+    #[cfg(target_os = "unknown")]
+    _drop_handles: Vec<Box<dyn std::fmt::Debug>>,
+    current_time: Instant,
+
+    #[cfg(target_os = "unknown")]
+    force_resize_event_rx: flume::Receiver<(u32, u32)>,
 }
 
 impl std::fmt::Debug for App {
@@ -435,30 +679,70 @@ impl App {
 
         tracing::debug!("Spawning event loop");
         event_loop.spawn(move |event, _, control_flow| {
-            tracing::debug!("Event: {event:?}");
+            // HACK(philpax): hackfix for https://github.com/AmbientRun/Ambient/issues/923
+            // remove after https://github.com/AmbientRun/Ambient/issues/1096
+            // inject resize events if required
+            if let Event::WindowEvent { window_id, .. } = &event {
+                if let Ok((width, height)) = self.force_resize_event_rx.try_recv() {
+                    self.handle_static_event(
+                        &Event::WindowEvent {
+                            window_id: *window_id,
+                            event: WindowEvent::Resized(winit::dpi::PhysicalSize::new(
+                                width, height,
+                            )),
+                        },
+                        control_flow,
+                    );
+                }
+            }
+
             // HACK(philpax): treat dpi changes as resize events. Ideally we'd handle this in handle_event proper,
             // but https://github.com/rust-windowing/winit/issues/1968 restricts us
-            if let Event::WindowEvent { window_id, event: WindowEvent::ScaleFactorChanged { new_inner_size, scale_factor } } = &event {
+            if let Event::WindowEvent {
+                window_id,
+                event:
+                    WindowEvent::ScaleFactorChanged {
+                        new_inner_size,
+                        scale_factor,
+                    },
+            } = &event
+            {
                 *self.world.resource_mut(window_scale_factor()) = *scale_factor;
                 self.handle_static_event(
-                    &Event::WindowEvent { window_id: *window_id, event: WindowEvent::Resized(**new_inner_size) },
+                    &Event::WindowEvent {
+                        window_id: *window_id,
+                        event: WindowEvent::Resized(**new_inner_size),
+                    },
                     control_flow,
                 );
             } else if let Some(event) = event.to_static() {
                 self.handle_static_event(&event, control_flow);
+            } else {
+                tracing::error!("Failed to convert event to static")
             }
         });
     }
 
-    pub fn run_blocking(mut self) {
+    pub fn run_blocking(mut self) -> ExitStatus {
         if let Some(event_loop) = self.event_loop.take() {
             event_loop.run(move |event, _, control_flow| {
                 // HACK(philpax): treat dpi changes as resize events. Ideally we'd handle this in handle_event proper,
                 // but https://github.com/rust-windowing/winit/issues/1968 restricts us
-                if let Event::WindowEvent { window_id, event: WindowEvent::ScaleFactorChanged { new_inner_size, scale_factor } } = &event {
+                if let Event::WindowEvent {
+                    window_id,
+                    event:
+                        WindowEvent::ScaleFactorChanged {
+                            new_inner_size,
+                            scale_factor,
+                        },
+                } = &event
+                {
                     *self.world.resource_mut(window_scale_factor()) = *scale_factor;
                     self.handle_static_event(
-                        &Event::WindowEvent { window_id: *window_id, event: WindowEvent::Resized(**new_inner_size) },
+                        &Event::WindowEvent {
+                            window_id: *window_id,
+                            event: WindowEvent::Resized(**new_inner_size),
+                        },
                         control_flow,
                     );
                 } else if let Some(event) = event.to_static() {
@@ -469,15 +753,20 @@ impl App {
             // Fake event loop in headless mode
             loop {
                 let mut control_flow = ControlFlow::default();
-                self.handle_static_event(&Event::MainEventsCleared, &mut control_flow);
+                let exit_status =
+                    self.handle_static_event(&Event::MainEventsCleared, &mut control_flow);
                 if control_flow == ControlFlow::Exit {
-                    return;
+                    return exit_status;
                 }
             }
         }
     }
 
-    pub fn handle_static_event(&mut self, event: &Event<'static, ()>, control_flow: &mut ControlFlow) {
+    pub fn handle_static_event(
+        &mut self,
+        event: &Event<'static, ()>,
+        control_flow: &mut ControlFlow,
+    ) -> ExitStatus {
         *control_flow = ControlFlow::Poll;
 
         // From: https://github.com/gfx-rs/wgpu/issues/1783
@@ -493,14 +782,41 @@ impl App {
         world.resource(gpu()).device.poll(wgpu::Maintain::Poll);
 
         self.window_event_systems.run(world, event);
+
         match event {
             Event::MainEventsCleared => {
+                let frame_start = Instant::now();
+                let external_time = frame_start.duration_since(self.current_time);
+
+                tracing::trace!(?event, "event");
+
                 // Handle window control events
                 for v in self.ctl_rx.try_iter() {
-                    tracing::debug!("Window control: {v:?}");
+                    tracing::trace!(?v, "window control");
                     match v {
                         WindowCtl::GrabCursor(mode) => {
                             if let Some(window) = &self.window {
+                                match mode {
+                                    CursorGrabMode::Confined | CursorGrabMode::Locked => {
+                                        // Move the cursor to the centre of the window to ensure
+                                        // the cursor is within the window and will not be locked
+                                        // in place outside the window.
+                                        //
+                                        // Without this, on macOS, the cursor will be locked in place
+                                        // and visible outside the window, which means the user can
+                                        // click on other aspects of the operating system while
+                                        // the cursor is locked.
+                                        let (width, height) =
+                                            <(u32, u32)>::from(window.inner_size());
+                                        window
+                                            .set_cursor_position(PhysicalPosition::new(
+                                                width / 2,
+                                                height / 2,
+                                            ))
+                                            .ok();
+                                    }
+                                    _ => {}
+                                }
                                 window.set_cursor_grab(mode).ok();
                             }
                         }
@@ -513,6 +829,24 @@ impl App {
                             if let Some(window) = &self.window {
                                 window.set_cursor_icon(icon);
                             }
+                        }
+                        WindowCtl::SetTitle(title) => {
+                            if let Some(window) = &self.window {
+                                window.set_title(&title);
+                            }
+                        }
+                        WindowCtl::SetFullscreen(fullscreen) => {
+                            if let Some(window) = &self.window {
+                                window.set_fullscreen(if fullscreen {
+                                    Some(Fullscreen::Borderless(None))
+                                } else {
+                                    None
+                                });
+                            }
+                        }
+                        WindowCtl::ExitProcess(exit_status) => {
+                            *control_flow = ControlFlow::Exit;
+                            return exit_status;
                         }
                     }
                 }
@@ -527,15 +861,43 @@ impl App {
                 }
 
                 if let Some(fps) = self.fps.frame_next() {
-                    world.set(world.resource_entity(), self::fps_stats(), fps.clone()).unwrap();
-                    if let Some(window) = &self.window {
-                        window.set_title(&format!("{} [{}, {} entities]", world.resource(window_title()), fps.dump_both(), world.len()));
+                    world
+                        .set(world.resource_entity(), self::fps_stats(), fps.clone())
+                        .unwrap();
+                    if self.update_title_with_fps_stats {
+                        if let Some(window) = &self.window {
+                            window.set_title(&format!(
+                                "{} [{}, {} entities]",
+                                world.resource(window_title()),
+                                fps.dump_both(),
+                                world.len()
+                            ));
+                        }
                     }
                 }
 
                 if let Some(window) = &self.window {
                     window.request_redraw();
                 }
+
+                let frame_end = Instant::now();
+
+                let frame_time = frame_end.duration_since(self.current_time);
+
+                tracing::debug!(?external_time, ?frame_time, "frame time");
+                self.current_time = frame_end;
+
+                let samples = world.resource_mut(performance_samples());
+
+                if samples.len() >= 128 {
+                    samples.remove(0);
+                }
+
+                samples.push(PerformanceSample {
+                    frame_time,
+                    external_time,
+                });
+
                 profiling::finish_frame!();
             }
 
@@ -555,8 +917,16 @@ impl App {
                         let scale_factor = window.scale_factor();
                         let logical_size = (size.as_dvec2() / scale_factor).as_uvec2();
 
-                        world.set_if_changed(world.resource_entity(), window_physical_size(), size).unwrap();
-                        world.set_if_changed(world.resource_entity(), window_logical_size(), logical_size).unwrap();
+                        world
+                            .set_if_changed(world.resource_entity(), window_physical_size(), size)
+                            .unwrap();
+                        world
+                            .set_if_changed(
+                                world.resource_entity(),
+                                window_logical_size(),
+                                logical_size,
+                            )
+                            .unwrap();
                     }
                 }
                 WindowEvent::CloseRequested => {
@@ -579,13 +949,22 @@ impl App {
                 }
                 WindowEvent::CursorMoved { position, .. } => {
                     if self.window_focused {
-                        world.set(world.resource_entity(), cursor_position(), vec2(position.x as f32, position.y as f32)).unwrap();
+                        let p = vec2(position.x as f32, position.y as f32)
+                            / self
+                                .window
+                                .as_ref()
+                                .map(|x| x.scale_factor() as f32)
+                                .unwrap_or(1.);
+                        world
+                            .set(world.resource_entity(), cursor_position(), p)
+                            .unwrap();
                     }
                 }
                 _ => {}
             },
             _ => {}
         }
+        ExitStatus::SUCCESS
     }
     pub fn add_system(&mut self, system: DynSystem) -> &mut Self {
         self.systems.add(system);
@@ -602,14 +981,21 @@ impl System<Event<'static, ()>> for ExamplesSystem {
             Event::WindowEvent {
                 event:
                     WindowEvent::KeyboardInput {
-                        input: KeyboardInput { virtual_keycode: Some(virtual_keycode), state: ElementState::Pressed, .. },
+                        input:
+                            KeyboardInput {
+                                virtual_keycode: Some(virtual_keycode),
+                                state: ElementState::Pressed,
+                                ..
+                            },
                         ..
                     },
                 ..
             } => match virtual_keycode {
-                VirtualKeyCode::F1 => dump_world_hierarchy_to_tmp_file(world),
+                VirtualKeyCode::F1 => dump_world_hierarchy_to_user(world),
+                #[cfg(not(target_os = "unknown"))]
                 VirtualKeyCode::F2 => world.dump_to_tmp_file(),
-                VirtualKeyCode::F3 => world.resource(examples_renderer()).lock().dump_to_tmp_file(),
+                #[cfg(not(target_os = "unknown"))]
+                VirtualKeyCode::F3 => world.resource(main_renderer()).lock().dump_to_tmp_file(),
                 _ => {}
             },
             _ => {}
@@ -623,9 +1009,10 @@ impl System for MeshBufferUpdate {
     fn run(&mut self, world: &mut World, _event: &FrameEvent) {
         profiling::scope!("MeshBufferUpdate.run");
         let assets = world.resource(asset_cache()).clone();
+        let gpu = world.resource(gpu()).clone();
         let mesh_buffer = MeshBufferKey.get(&assets);
         let mut mesh_buffer = mesh_buffer.lock();
-        mesh_buffer.update();
+        mesh_buffer.update(&gpu);
     }
 }
 

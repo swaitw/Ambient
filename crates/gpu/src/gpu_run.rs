@@ -1,36 +1,70 @@
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
-use ambient_std::{
+use ambient_native_std::{
     asset_cache::{AssetCache, SyncAssetKeyExt},
     CowStr,
 };
+use itertools::Itertools;
 use wgpu::{BindGroup, BindGroupLayoutEntry, BufferUsages, ShaderStages};
 
 use crate::{
-    gpu::{GpuKey, WgslType},
-    shader_module::{Shader, ShaderModule, ShaderModuleIdentifier},
+    gpu::{Gpu, WgslType},
+    shader_module::{BindGroupDesc, Shader, ShaderIdent, ShaderModule},
     typed_buffer::TypedBuffer,
 };
 
+fn get_gpu_run_layout() -> BindGroupDesc<'static> {
+    BindGroupDesc {
+        entries: vec![
+            BindGroupLayoutEntry {
+                binding: 0,
+                visibility: ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            BindGroupLayoutEntry {
+                binding: 1,
+                visibility: ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: false },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+        ],
+        label: "GPURUN_BIND_GROUP".into(),
+    }
+}
+
 pub struct GpuRun {
     label: CowStr,
-    modules: Vec<ShaderModule>,
+    modules: Vec<Arc<ShaderModule>>,
     body: CowStr,
-    bind_groups: HashMap<CowStr, BindGroup>,
+    bind_groups: Vec<(CowStr, BindGroup)>,
 }
 
 impl GpuRun {
     pub fn new(label: impl Into<CowStr>, body: impl Into<CowStr>) -> Self {
-        Self { body: body.into(), modules: Default::default(), bind_groups: Default::default(), label: label.into() }
+        Self {
+            body: body.into(),
+            modules: Default::default(),
+            bind_groups: Default::default(),
+            label: label.into(),
+        }
     }
 
-    pub fn add_module(mut self, module: ShaderModule) -> Self {
+    pub fn add_module(mut self, module: Arc<ShaderModule>) -> Self {
         self.modules.push(module);
         self
     }
 
     pub fn add_bind_group(mut self, name: impl Into<CowStr>, bind_group: wgpu::BindGroup) -> Self {
-        self.bind_groups.insert(name.into(), bind_group);
+        self.bind_groups.push((name.into(), bind_group));
         self
     }
 
@@ -43,75 +77,79 @@ impl GpuRun {
         let in_type = In::wgsl_type();
         let out_type = Out::wgsl_type();
 
-        let module = ShaderModule::new(
-            "GpuRun",
-            include_str!("gpu_run.wgsl"),
-            vec![
-                ShaderModuleIdentifier::bind_group(crate::shader_module::BindGroupDesc {
-                    entries: vec![
-                        BindGroupLayoutEntry {
-                            binding: 0,
-                            visibility: ShaderStages::COMPUTE,
-                            ty: wgpu::BindingType::Buffer {
-                                ty: wgpu::BufferBindingType::Storage { read_only: true },
-                                has_dynamic_offset: false,
-                                min_binding_size: None,
-                            },
-                            count: None,
-                        },
-                        BindGroupLayoutEntry {
-                            binding: 1,
-                            visibility: ShaderStages::COMPUTE,
-                            ty: wgpu::BindingType::Buffer {
-                                ty: wgpu::BufferBindingType::Storage { read_only: false },
-                                has_dynamic_offset: false,
-                                min_binding_size: None,
-                            },
-                            count: None,
-                        },
-                    ],
-                    label: "GPURUN_BIND_GROUP".into(),
-                }),
-                ShaderModuleIdentifier::constant("IN_SIZE", in_size),
-                ShaderModuleIdentifier::constant("OUT_SIZE", out_size),
-                ShaderModuleIdentifier::raw("WGSL_IN", in_type),
-                ShaderModuleIdentifier::raw("WGSL_OUT", out_type),
-                ShaderModuleIdentifier::raw("WGSL_BODY", body.clone()),
-            ],
-        );
+        let module = ShaderModule::new("GpuRun", include_str!("gpu_run.wgsl"))
+            .with_binding_desc(get_gpu_run_layout())
+            .with_ident(ShaderIdent::constant("IN_SIZE", in_size))
+            .with_ident(ShaderIdent::constant("OUT_SIZE", out_size))
+            .with_ident(ShaderIdent::raw("WGSL_IN", in_type))
+            .with_ident(ShaderIdent::raw("WGSL_OUT", out_type))
+            .with_ident(ShaderIdent::raw("WGSL_BODY", body.clone()))
+            .with_dependencies(modules.iter().cloned());
 
-        let shader = Shader::from_modules(assets, format!("GpuRun.{}", self.label), modules.iter().chain([&module]));
-        shader
+        Shader::new(
+            assets,
+            format!("GpuRun.{}", self.label),
+            &["GPURUN_BIND_GROUP"]
+                .into_iter()
+                .chain(self.bind_groups.iter().map(|v| &*v.0))
+                .collect_vec(),
+            &module,
+        )
+        .unwrap()
     }
 
-    pub async fn run<In: WgslType, Out: WgslType>(self, assets: &AssetCache, input: In) -> Out {
+    pub async fn run<In: WgslType, Out: WgslType>(
+        self,
+        gpu: &Gpu,
+        assets: &AssetCache,
+        input: In,
+    ) -> Out {
         let shader = self.into_shader::<In, Out>(assets);
 
-        let gpu = GpuKey.get(assets);
+        let in_buffer = TypedBuffer::new_init(
+            gpu,
+            Some("GpuRun.in"),
+            BufferUsages::COPY_DST | BufferUsages::STORAGE,
+            &[input],
+        );
 
-        let in_buffer = TypedBuffer::new_init(gpu.clone(), "GpuRun.in", BufferUsages::COPY_DST | BufferUsages::STORAGE, &[input]);
-        let out_buffer =
-            TypedBuffer::new_init(gpu.clone(), "GpuRun.out", BufferUsages::STORAGE | BufferUsages::COPY_SRC, &[Out::zeroed(); 1]);
+        let out_buffer = TypedBuffer::new_init(
+            gpu,
+            Some("GpuRun.out"),
+            BufferUsages::STORAGE | BufferUsages::COPY_SRC,
+            &[Out::zeroed()],
+        );
 
-        let pipeline = shader.to_compute_pipeline(&GpuKey.get(assets), "main");
+        let pipeline = shader.to_compute_pipeline(gpu, "main");
 
         let bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("GpuRun"),
-            layout: shader.get_bind_group_layout_by_name("GPURUN_BIND_GROUP").unwrap(),
+            layout: &get_gpu_run_layout().get(assets),
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: in_buffer.buffer().as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: out_buffer.buffer().as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: in_buffer.buffer().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: out_buffer.buffer().as_entire_binding(),
+                },
             ],
         });
 
-        let mut encoder = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        let mut encoder = gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None });
             pass.set_pipeline(pipeline.pipeline());
-            pipeline.bind(&mut pass, "GPURUN_BIND_GROUP", &bind_group);
 
-            for (k, v) in &self.bind_groups {
-                pipeline.bind(&mut pass, k, v);
+            for (i, v) in [&bind_group]
+                .into_iter()
+                .chain(self.bind_groups.iter().map(|v| &v.1))
+                .enumerate()
+            {
+                pass.set_bind_group(i as _, v, &[]);
             }
 
             pass.dispatch_workgroups(1, 1, 1);
@@ -121,7 +159,10 @@ impl GpuRun {
 
         // Only one
 
-        out_buffer.read(.., true).await.expect("Failed to map buffer")[0]
+        out_buffer
+            .read_staging(gpu, ..)
+            .await
+            .expect("Failed to map buffer")[0]
     }
 }
 
@@ -129,7 +170,7 @@ impl GpuRun {
 mod test {
     use std::sync::Arc;
 
-    use ambient_std::asset_cache::{AssetCache, SyncAssetKeyExt};
+    use ambient_native_std::asset_cache::{AssetCache, SyncAssetKeyExt};
     use glam::{Vec2, Vec4, Vec4Swizzles};
 
     use crate::{gpu::GpuKey, gpu_run::GpuRun};
@@ -137,11 +178,13 @@ mod test {
     #[tokio::test]
     async fn test_gpu_run() {
         use crate::gpu::Gpu;
-        let gpu = Arc::new(Gpu::new(None).await);
+        let gpu = Arc::new(Gpu::new(None).await.unwrap());
         let assets = AssetCache::new(tokio::runtime::Handle::current());
-        GpuKey.insert(&assets, gpu);
+        GpuKey.insert(&assets, gpu.clone());
         let input = Vec4::ONE;
-        let res: Vec2 = GpuRun::new("TestGpuRun", "return (input * 3.).xy;").run(&assets, input).await;
+        let res: Vec2 = GpuRun::new("TestGpuRun", "return (input * 3.).xy;")
+            .run(&gpu, &assets, input)
+            .await;
         assert_eq!(res, (input * 3.).xy());
     }
 }

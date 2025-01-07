@@ -1,0 +1,29 @@
+[package]
+id = "jruv4zn5tfe2s3kpyhhq7z3uezbi27cv"
+name = "To-do List"
+description = "A multiplayer to-do list."
+version = "0.3.2-nightly-2024-01-11"
+repository = "https://github.com/AmbientRun/Ambient/tree/main/guest/rust/examples/ui/todo"
+type = "Game"
+content = { type = "Playable", example = true }
+ambient_version = "0.3.2-nightly-2024-01-11"
+
+[messages.NewItem]
+description = "Add a new todo item"
+fields = { description = "String" }
+
+[messages.DeleteItem]
+description = "Remove todo item"
+fields = { id = "EntityId" }
+
+[components.todo_item]
+type = "String"
+name = "Todo item"
+description = "Item in the todo list."
+attributes = ["Networked", "Debuggable"]
+
+[components.todo_time]
+type = "Duration"
+name = "Todo time"
+description = "The time the todo was created."
+attributes = ["Networked", "Debuggable"]

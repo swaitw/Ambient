@@ -1,0 +1,22 @@
+[package]
+name = "visualize_colliders"
+
+edition = "2021"
+publish = false
+rust-version = { workspace = true }
+version = { workspace = true }
+
+[dependencies]
+ambient_api = { workspace = true }
+
+[build-dependencies]
+ambient_package_projection = { workspace = true }
+
+[[bin]]
+name = "visualize_colliders_server"
+path = "src/server.rs"
+required-features = ["server"]
+
+[features]
+client = ["ambient_api/client"]
+server = ["ambient_api/server"]

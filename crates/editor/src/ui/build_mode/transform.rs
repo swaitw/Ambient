@@ -1,24 +1,33 @@
 use std::{sync::Arc, time::Duration};
 
-use ambient_core::{runtime, transform::get_world_transform, window::cursor_position, window::screen_to_clip_space};
+use ambient_core::{
+    runtime, transform::get_world_transform, window::cursor_position, window::screen_to_clip_space,
+};
 use ambient_ecs::{EntityId, World};
-use ambient_element::{element_component, Element, ElementComponent, ElementComponentExt, Group, Hooks};
-use ambient_network::client::GameClient;
-use ambient_std::{
+use ambient_element::{
+    consume_context, element_component, use_memo_with, use_state, use_state_with, Element,
+    ElementComponent, ElementComponentExt, Group, Hooks,
+};
+use ambient_native_std::{
     cb,
     shapes::{Plane, Ray, RayIntersectable},
     Cb,
 };
-use ambient_ui::{space_between_items, Button, FlowRow, HighjackMouse, Hotkey, Separator, STREET};
-use ambient_window_types::MouseButton;
-use ambient_window_types::{ModifiersState, VirtualKeyCode};
+use ambient_network::client::ClientState;
+use ambient_shared_types::{ModifiersState, MouseButton, VirtualKeyCode};
+use ambient_ui_native::{
+    space_between_items, Button, FlowRow, HighjackMouse, Hotkey, Separator, STREET,
+};
 use anyhow::Context;
 use glam::{vec3, Mat4, Quat, Vec2, Vec3, Vec3Swizzles};
 use itertools::Itertools;
 use parking_lot::Mutex;
 
 use crate::{
-    intents::{intent_place_ray, intent_set_transform, intent_translate, IntentPlaceRay, IntentTransform, IntentTranslate, TerrainOffset},
+    intents::{
+        intent_place_ray, intent_set_transform, intent_translate, IntentPlaceRay, IntentTransform,
+        IntentTranslate, TerrainOffset,
+    },
     rpc::AxisFlags,
     ui::{
         build_mode::{AxisGuide, EditorAction, GridGuide},
@@ -52,7 +61,9 @@ enum ConstraintSpace {
 impl ConstraintSpace {
     pub fn constrain(&self, p: Vec3) -> Vec3 {
         match *self {
-            ConstraintSpace::Plane { normal, point } => point + (p - point).reject_from_normalized(normal),
+            ConstraintSpace::Plane { normal, point } => {
+                point + (p - point).reject_from_normalized(normal)
+            }
             ConstraintSpace::Axis { axis, point } => point + axis * (p - point).dot(axis),
         }
     }
@@ -86,21 +97,31 @@ pub struct IntialState {
     midpoint: Vec3,
 }
 
-fn initial_transforms(hooks: &mut Hooks, game_client: &GameClient, targets: Arc<[EntityId]>) -> IntialState {
-    hooks.use_memo_with(targets, |_, targets| {
-        let state = game_client.game_state.lock();
+fn initial_transforms(
+    hooks: &mut Hooks,
+    client_state: &ClientState,
+    targets: Arc<[EntityId]>,
+) -> IntialState {
+    use_memo_with(hooks, targets, |_, targets| {
+        let state = client_state.game_state.lock();
         let transforms = match get_world_transforms(&state.world, targets) {
             Ok(v) => v,
             Err(err) => {
-                log::error!("{err:?}");
+                tracing::error!("{err:?}");
                 return Default::default();
             }
         };
 
-        let midpoint: Vec3 =
-            transforms.iter().map(|v| v.transform_point3(Vec3::ZERO)).fold(Vec3::ZERO, |acc, x| acc + x) / (targets.len().max(1)) as f32;
+        let midpoint: Vec3 = transforms
+            .iter()
+            .map(|v| v.transform_point3(Vec3::ZERO))
+            .fold(Vec3::ZERO, |acc, x| acc + x)
+            / (targets.len().max(1)) as f32;
 
-        IntialState { transforms, midpoint }
+        IntialState {
+            transforms,
+            midpoint,
+        }
     })
 }
 
@@ -108,17 +129,17 @@ fn initial_transforms(hooks: &mut Hooks, game_client: &GameClient, targets: Arc<
 pub(super) fn PlaceController(
     hooks: &mut Hooks,
     targets: Arc<[EntityId]>,
-    on_click: Cb<dyn Fn(ambient_window_types::MouseButton) + Sync + Send>,
+    on_click: Cb<dyn Fn(ambient_shared_types::MouseButton) + Sync + Send>,
 ) -> Element {
     assert_ne!(targets.len(), 0);
-    let (game_client, _) = hooks.consume_context::<GameClient>().unwrap();
-    let (prefs, _) = hooks.consume_context::<EditorPrefs>().unwrap();
+    let (client_state, _) = consume_context::<ClientState>(hooks).unwrap();
+    let (prefs, _) = consume_context::<EditorPrefs>(hooks).unwrap();
 
     // Use a memo, that way the intent is reverted when the axis changes
-    let action = hooks.use_memo_with(prefs, |world, _| {
+    let action = use_memo_with(hooks, prefs, |world, _| {
         Arc::new(Mutex::new(EditorAction::new(
             world.resource(runtime()).clone(),
-            game_client.clone(),
+            client_state.clone(),
             intent_place_ray(),
             TRANSFORM_THROTTLE,
         )))
@@ -129,7 +150,7 @@ pub(super) fn PlaceController(
         on_click: {
             let action = action.clone();
             cb(move |button| {
-                if button != ambient_window_types::MouseButton::Left {
+                if button != ambient_shared_types::MouseButton::Left {
                     return;
                 }
                 if let Some(action) = action.upgrade() {
@@ -139,14 +160,18 @@ pub(super) fn PlaceController(
             })
         },
         on_mouse_move: cb(move |world, _, _| {
-            let state = game_client.game_state.lock();
+            let state = client_state.game_state.lock();
             let mouse_clip_pos = screen_to_clip_space(world, *world.resource(cursor_position()));
 
             let targets = targets.clone();
 
             let ray = state.screen_ray(mouse_clip_pos);
 
-            let intent = IntentPlaceRay { targets: targets.to_vec(), ray, snap: prefs.snap };
+            let intent = IntentPlaceRay {
+                targets: targets.to_vec(),
+                ray,
+                snap: prefs.snap,
+            };
 
             if let Some(action) = action.upgrade() {
                 action.lock().push_intent(intent);
@@ -171,25 +196,25 @@ impl ElementComponent for TranslationController {
     fn render(self: Box<Self>, hooks: &mut Hooks) -> Element {
         let Self { targets, on_click } = *self;
 
-        let (axis, set_axis) = hooks.use_state(AxisFlags::all());
+        let (axis, set_axis) = use_state(hooks, AxisFlags::all());
 
         assert_ne!(targets.len(), 0);
-        let (game_client, _) = hooks.consume_context::<GameClient>().unwrap();
-        let (prefs, _) = hooks.consume_context::<EditorPrefs>().unwrap();
+        let (client_state, _) = consume_context::<ClientState>(hooks).unwrap();
+        let (prefs, _) = consume_context::<EditorPrefs>(hooks).unwrap();
 
         // Freeze to_relative to the position when moving was started
-        let initial_state = initial_transforms(hooks, &game_client, targets.clone());
+        let initial_state = initial_transforms(hooks, &client_state, targets.clone());
 
-        let game_state = game_client.game_state.lock();
+        let game_state = client_state.game_state.lock();
 
         let to_target_local = to_isometry(initial_state.transforms.last().unwrap().inverse());
         let to_view_local = to_isometry(game_state.view().unwrap());
 
         // Use a memo, that way the intent is reverted when the axis changes
-        let action = hooks.use_memo_with((axis, prefs), |world, _| {
+        let action = use_memo_with(hooks, (axis, prefs), |world, _| {
             Arc::new(Mutex::new(EditorAction::new(
                 world.resource(runtime()).clone(),
-                game_client.clone(),
+                client_state.clone(),
                 intent_translate(),
                 TRANSFORM_THROTTLE,
             )))
@@ -197,9 +222,13 @@ impl ElementComponent for TranslationController {
 
         let action = Arc::downgrade(&action);
 
-        let (initial_cursor_offset, _) = hooks.use_state_with(|world| {
+        let (initial_cursor_offset, _) = use_state_with(hooks, |world| {
             let mouse_clip_pos = screen_to_clip_space(world, *world.resource(cursor_position()));
-            let clip_pos = game_state.proj_view().unwrap().project_point3(initial_state.midpoint).xy();
+            let clip_pos = game_state
+                .proj_view()
+                .unwrap()
+                .project_point3(initial_state.midpoint)
+                .xy();
             mouse_clip_pos - clip_pos
         });
 
@@ -213,23 +242,47 @@ impl ElementComponent for TranslationController {
         let (to_relative, constraints) = match bits.count_ones() {
             1 => {
                 // Line
-                let to_relative = if prefs.use_global_coordinates { Default::default() } else { to_target_local };
+                let to_relative = if prefs.use_global_coordinates {
+                    Default::default()
+                } else {
+                    to_target_local
+                };
                 let point = to_relative.transform_point3(initial_state.midpoint);
                 let point = prefs.snap(point);
 
-                (to_relative, ConstraintSpace::Axis { axis: axis_vec, point })
+                (
+                    to_relative,
+                    ConstraintSpace::Axis {
+                        axis: axis_vec,
+                        point,
+                    },
+                )
             }
             2 => {
-                let to_relative = if prefs.use_global_coordinates { Default::default() } else { to_target_local };
+                let to_relative = if prefs.use_global_coordinates {
+                    Default::default()
+                } else {
+                    to_target_local
+                };
                 let point = to_relative.transform_point3(initial_state.midpoint);
                 let point = prefs.snap(point);
 
-                (to_relative, ConstraintSpace::Plane { normal: 1.0 - axis_vec, point })
+                (
+                    to_relative,
+                    ConstraintSpace::Plane {
+                        normal: 1.0 - axis_vec,
+                        point,
+                    },
+                )
             }
             // Do stuff in view space
-            0 | 3 => {
-                (to_view_local, ConstraintSpace::Plane { normal: Vec3::Z, point: to_view_local.transform_point3(initial_state.midpoint) })
-            }
+            0 | 3 => (
+                to_view_local,
+                ConstraintSpace::Plane {
+                    normal: Vec3::Z,
+                    point: to_view_local.transform_point3(initial_state.midpoint),
+                },
+            ),
             _ => unreachable!(),
         };
 
@@ -243,7 +296,8 @@ impl ElementComponent for TranslationController {
 
                     // Convert it into world space
                     GridGuide {
-                        rotation: Quat::from_mat4(&from_relative) * Quat::from_rotation_arc(Vec3::Z, normal),
+                        rotation: Quat::from_mat4(&from_relative)
+                            * Quat::from_rotation_arc(Vec3::Z, normal),
                         // Transform into world space
                         point: from_relative.transform_point3(point),
                     }
@@ -262,63 +316,70 @@ impl ElementComponent for TranslationController {
 
         drop(game_state);
 
-        AxisButtons { axis, set_axis }.el().children(vec![Group(vec![
-            guide,
-            HighjackMouse {
-                on_click: {
-                    let action = action.clone();
-                    cb(move |button| {
-                        if button != ambient_window_types::MouseButton::Left {
-                            return;
-                        }
+        AxisButtons { axis, set_axis }
+            .el()
+            .children(vec![Group(vec![
+                guide,
+                HighjackMouse {
+                    on_click: {
+                        let action = action.clone();
+                        cb(move |button| {
+                            if button != ambient_shared_types::MouseButton::Left {
+                                return;
+                            }
+
+                            if let Some(action) = action.upgrade() {
+                                action.lock().confirm();
+                            }
+
+                            on_click(button)
+                        })
+                    },
+                    on_mouse_move: cb(move |world, _, _| {
+                        let game_state = client_state.game_state.lock();
+                        let mouse_clip_pos =
+                            screen_to_clip_space(world, *world.resource(cursor_position()))
+                                - initial_cursor_offset;
+
+                        assert!(!axis.is_empty());
+
+                        let targets = targets.clone();
+
+                        let mut ray = game_state.screen_ray(mouse_clip_pos);
+
+                        // Transform the picking ray to relative space
+                        ray.dir = to_relative.transform_vector3(ray.dir);
+                        ray.origin = to_relative.transform_point3(ray.origin);
+
+                        let position = match constraints.intersect(ray, to_view_local) {
+                            Some(v) => v,
+                            None => {
+                                tracing::warn!("No intersect");
+                                return;
+                            }
+                        };
+
+                        let position = prefs.snap(position);
+                        let position = constraints.constrain(position);
+
+                        // Convert back into world space
+                        let position = from_relative.transform_point3(position);
+
+                        let intent = IntentTranslate {
+                            targets: targets.to_vec(),
+                            position,
+                        };
+                        tracing::debug!("Translating: {intent:#?}");
 
                         if let Some(action) = action.upgrade() {
-                            action.lock().confirm();
+                            action.lock().push_intent(intent);
                         }
-
-                        on_click(button)
-                    })
-                },
-                on_mouse_move: cb(move |world, _, _| {
-                    let game_state = game_client.game_state.lock();
-                    let mouse_clip_pos = screen_to_clip_space(world, *world.resource(cursor_position())) - initial_cursor_offset;
-
-                    assert!(!axis.is_empty());
-
-                    let targets = targets.clone();
-
-                    let mut ray = game_state.screen_ray(mouse_clip_pos);
-
-                    // Transform the picking ray to relative space
-                    ray.dir = to_relative.transform_vector3(ray.dir);
-                    ray.origin = to_relative.transform_point3(ray.origin);
-
-                    let position = match constraints.intersect(ray, to_view_local) {
-                        Some(v) => v,
-                        None => {
-                            tracing::warn!("No intersect");
-                            return;
-                        }
-                    };
-
-                    let position = prefs.snap(position);
-                    let position = constraints.constrain(position);
-
-                    // Convert back into world space
-                    let position = from_relative.transform_point3(position);
-
-                    let intent = IntentTranslate { targets: targets.to_vec(), position };
-                    tracing::debug!("Translating: {intent:#?}");
-
-                    if let Some(action) = action.upgrade() {
-                        action.lock().push_intent(intent);
-                    }
-                }),
-                hide_mouse: false,
-            }
-            .el(),
-        ])
-        .el()])
+                    }),
+                    hide_mouse: false,
+                }
+                .el(),
+            ])
+            .el()])
     }
 }
 
@@ -330,18 +391,23 @@ pub(super) struct ScaleController {
 impl ElementComponent for ScaleController {
     fn render(self: Box<Self>, hooks: &mut Hooks) -> Element {
         let Self { on_click, targets } = *self;
-        let (game_client, _) = hooks.consume_context::<GameClient>().unwrap();
+        let (client_state, _) = consume_context::<ClientState>(hooks).unwrap();
         let runtime = hooks.world.resource(runtime()).clone();
-        let (axis, set_axis) = hooks.use_state(AxisFlags::all());
+        let (axis, set_axis) = use_state(hooks, AxisFlags::all());
 
-        let action = hooks.use_memo_with(axis, |_, _| {
-            Arc::new(Mutex::new(EditorAction::new(runtime, game_client.clone(), intent_set_transform(), TRANSFORM_THROTTLE)))
+        let action = use_memo_with(hooks, axis, |_, _| {
+            Arc::new(Mutex::new(EditorAction::new(
+                runtime,
+                client_state.clone(),
+                intent_set_transform(),
+                TRANSFORM_THROTTLE,
+            )))
         });
 
         let action = Arc::downgrade(&action);
 
         // Freeze to_relative to the position when moving was started
-        let state = initial_transforms(hooks, &game_client, targets.clone());
+        let state = initial_transforms(hooks, &client_state, targets.clone());
 
         let update = {
             let action = action.clone();
@@ -360,9 +426,14 @@ impl ElementComponent for ScaleController {
                 }
 
                 let to_local = Mat4::from_translation(-state.midpoint);
-                let to_scaled_world = Mat4::from_translation(state.midpoint) * Mat4::from_scale(new_scale);
+                let to_scaled_world =
+                    Mat4::from_translation(state.midpoint) * Mat4::from_scale(new_scale);
 
-                let new_transforms = state.transforms.iter().map(|&transform| to_scaled_world * (to_local * transform)).collect_vec();
+                let new_transforms = state
+                    .transforms
+                    .iter()
+                    .map(|&transform| to_scaled_world * (to_local * transform))
+                    .collect_vec();
 
                 if let Some(action) = action.upgrade() {
                     action.lock().push_intent(IntentTransform {
@@ -374,21 +445,23 @@ impl ElementComponent for ScaleController {
             })
         };
 
-        AxisButtons { axis, set_axis }.el().children(vec![Group(vec![HighjackMouse {
-            on_mouse_move: cb(move |_, pos, _| update(pos)),
-            on_click: cb(move |button| {
-                if button != MouseButton::Left {
-                    return;
-                }
-                if let Some(action) = action.upgrade() {
-                    action.lock().confirm();
-                }
-                on_click(button);
-            }),
-            hide_mouse: false,
-        }
-        .el()])
-        .el()])
+        AxisButtons { axis, set_axis }
+            .el()
+            .children(vec![Group(vec![HighjackMouse {
+                on_mouse_move: cb(move |_, pos, _| update(pos)),
+                on_click: cb(move |button| {
+                    if button != MouseButton::Left {
+                        return;
+                    }
+                    if let Some(action) = action.upgrade() {
+                        action.lock().confirm();
+                    }
+                    on_click(button);
+                }),
+                hide_mouse: false,
+            }
+            .el()])
+            .el()])
     }
 }
 
@@ -401,20 +474,25 @@ pub(super) struct RotateController {
 impl ElementComponent for RotateController {
     fn render(self: Box<Self>, hooks: &mut Hooks) -> Element {
         let Self { on_click, targets } = *self;
-        let (game_client, _) = hooks.consume_context::<GameClient>().unwrap();
+        let (client_state, _) = consume_context::<ClientState>(hooks).unwrap();
         let runtime = hooks.world.resource(runtime()).clone();
-        let (axis, set_axis) = hooks.use_state(AxisFlags::all());
+        let (axis, set_axis) = use_state(hooks, AxisFlags::all());
 
-        let (prefs, _) = hooks.consume_context::<EditorPrefs>().unwrap();
+        let (prefs, _) = consume_context::<EditorPrefs>(hooks).unwrap();
 
-        let action = hooks.use_memo_with(axis, |_, _| {
-            Arc::new(Mutex::new(EditorAction::new(runtime, game_client.clone(), intent_set_transform(), TRANSFORM_THROTTLE)))
+        let action = use_memo_with(hooks, axis, |_, _| {
+            Arc::new(Mutex::new(EditorAction::new(
+                runtime,
+                client_state.clone(),
+                intent_set_transform(),
+                TRANSFORM_THROTTLE,
+            )))
         });
 
         let action = Arc::downgrade(&action);
 
         // Freeze to_relative to the position when moving was started
-        let state = initial_transforms(hooks, &game_client, targets.clone());
+        let state = initial_transforms(hooks, &client_state, targets.clone());
 
         let to_relative = {
             if prefs.use_global_coordinates {
@@ -426,8 +504,12 @@ impl ElementComponent for RotateController {
             }
         };
 
-        let midpoint: Vec3 =
-            state.transforms.iter().map(|v| v.transform_point3(Vec3::ZERO)).fold(Vec3::ZERO, |acc, x| acc + x) / targets.len() as f32;
+        let midpoint: Vec3 = state
+            .transforms
+            .iter()
+            .map(|v| v.transform_point3(Vec3::ZERO))
+            .fold(Vec3::ZERO, |acc, x| acc + x)
+            / targets.len() as f32;
 
         let axis = if axis.is_all() {
             AxisFlags::Z
@@ -453,12 +535,18 @@ impl ElementComponent for RotateController {
                 let pitch = axis.x * mov;
                 let roll = axis.y * (1.0 - axis.x) * mov;
 
-                let rot = Quat::from_axis_angle(up, yaw) * Quat::from_axis_angle(right, pitch) * Quat::from_axis_angle(forward, roll);
+                let rot = Quat::from_axis_angle(up, yaw)
+                    * Quat::from_axis_angle(right, pitch)
+                    * Quat::from_axis_angle(forward, roll);
 
                 let to_local = Mat4::from_translation(-midpoint);
                 let to_rotated_world = Mat4::from_translation(midpoint) * Mat4::from_quat(rot);
 
-                let new_transforms = state.transforms.iter().map(|&transform| to_rotated_world * to_local * transform).collect_vec();
+                let new_transforms = state
+                    .transforms
+                    .iter()
+                    .map(|&transform| to_rotated_world * to_local * transform)
+                    .collect_vec();
 
                 if let Some(action) = action.upgrade() {
                     action.lock().push_intent(IntentTransform {
@@ -472,13 +560,31 @@ impl ElementComponent for RotateController {
 
         let mut items = Vec::new();
         if axis.contains(AxisFlags::X) {
-            items.push(AxisGuide { axis: right, point: midpoint }.el())
+            items.push(
+                AxisGuide {
+                    axis: right,
+                    point: midpoint,
+                }
+                .el(),
+            )
         }
         if axis.contains(AxisFlags::Y) {
-            items.push(AxisGuide { axis: forward, point: midpoint }.el())
+            items.push(
+                AxisGuide {
+                    axis: forward,
+                    point: midpoint,
+                }
+                .el(),
+            )
         }
         if axis.contains(AxisFlags::Z) {
-            items.push(AxisGuide { axis: up, point: midpoint }.el())
+            items.push(
+                AxisGuide {
+                    axis: up,
+                    point: midpoint,
+                }
+                .el(),
+            )
         }
 
         items.push(
@@ -500,12 +606,18 @@ impl ElementComponent for RotateController {
             .el(),
         );
 
-        AxisButtons { axis, set_axis }.el().children(vec![Group(items).el()])
+        AxisButtons { axis, set_axis }
+            .el()
+            .children(vec![Group(items).el()])
     }
 }
 
 #[element_component]
-pub fn AxisButtons(_: &mut Hooks, axis: AxisFlags, set_axis: Cb<dyn Fn(AxisFlags) + Send + Sync>) -> Element {
+pub fn AxisButtons(
+    _: &mut Hooks,
+    axis: AxisFlags,
+    set_axis: Cb<dyn Fn(AxisFlags) + Send + Sync>,
+) -> Element {
     let toggle_axis = move |new: AxisFlags| {
         if axis == new {
             set_axis(AxisFlags::all())
@@ -572,5 +684,5 @@ pub fn AxisButtons(_: &mut Hooks, axis: AxisFlags, set_axis: Cb<dyn Fn(AxisFlags
         .el(),
     ])
     .el()
-    .set(space_between_items(), STREET)
+    .with(space_between_items(), STREET)
 }

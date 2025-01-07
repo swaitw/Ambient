@@ -1,0 +1,35 @@
+[package]
+id = "cneomdouziieskjvs3szwmigzotofjzs"
+name = "Explosion [WIP]"
+description = "Implements *very* simple explosions."
+version = "0.3.2-nightly-2024-01-11"
+content = { type = "Asset", code = true }
+ambient_version = "0.3.2-nightly-2024-01-11"
+
+[dependencies]
+game_object = { path = "../../schemas/game_object", id = "hvxms7i2px7krvkm23sxfjxsjqlcmtb5", version = "0.3.2-nightly-2024-01-11" }
+
+[components]
+is_explosion = { type = "Empty", name = "Is Explosion", description = "Is an explosion", attributes = [
+    "Networked",
+] }
+radius = { type = "F32", name = "Radius", description = "Radius of the explosion", attributes = [
+    "Networked",
+] }
+damage = { type = "F32", name = "Damage", description = "Damage of the explosion", attributes = [
+    "Networked",
+] }
+
+# Internal
+created_at = { type = "Duration", name = "Created At", description = "Time the explosion was created. Must be manually attached using a spawn_query as time is not synchronized between client and server at time of writing." }
+
+[concepts.Explosion]
+name = "Explosion"
+description = "An explosion"
+[concepts.Explosion.components.required]
+is_explosion = {}
+radius = {}
+damage = {}
+"ambient_core::transform::translation" = {}
+[concepts.Explosion.components.optional]
+created_at = {}

@@ -27,11 +27,6 @@ use serde::{Deserialize, Serialize};
 trait AssetHolder: as_any::AsAny + Sync + Send {}
 impl<T: Clone + Sync + Send + Any + 'static> AssetHolder for T {}
 
-impl as_any::Downcast for dyn AssetHolder {}
-impl as_any::Downcast for dyn AssetHolder + Send {}
-impl as_any::Downcast for dyn AssetHolder + Sync {}
-impl as_any::Downcast for dyn AssetHolder + Send + Sync {}
-
 #[derive(Clone)]
 struct LoadPayload {
     asset_key: AssetKey,
@@ -75,8 +70,13 @@ impl Deref for AssetKey {
 
 #[derive(Clone)]
 pub(crate) enum ContentState {
-    Loading { fut: WeakShared<BoxFuture<'static, LoadPayload>> },
-    Loaded { value: Arc<dyn AssetHolder>, check_alive: Arc<dyn Fn() -> bool + Send + Sync> },
+    Loading {
+        fut: WeakShared<BoxFuture<'static, LoadPayload>>,
+    },
+    Loaded {
+        value: Arc<dyn AssetHolder>,
+        check_alive: Arc<dyn Fn() -> bool + Send + Sync>,
+    },
     Aborted,
     Expired,
 }
@@ -125,7 +125,10 @@ impl ContentState {
     /// Returns the concrete loaded value if loaded and kept alive (strong count).
     fn get_loaded_value<T: Asset + Clone + Sync + Send + 'static>(&self) -> Option<T> {
         if let ContentState::Loaded { value, .. } = &self {
-            let content = value.as_any().downcast_ref::<<T as Asset>::WeakType>().unwrap();
+            let content = value
+                .as_any()
+                .downcast_ref::<<T as Asset>::WeakType>()
+                .unwrap();
             let content = T::from_weak(content)?;
             Some(content)
         } else {
@@ -171,7 +174,10 @@ impl AssetCache {
     pub fn new(runtime: impl Into<RuntimeHandle>) -> Self {
         Self::new_with_config(runtime.into(), None)
     }
-    pub fn new_with_config(runtime: impl Into<RuntimeHandle>, max_keepalive: Option<Duration>) -> Self {
+    pub fn new_with_config(
+        runtime: impl Into<RuntimeHandle>,
+        max_keepalive: Option<Duration>,
+    ) -> Self {
         let runtime = runtime.into();
 
         let assets = Self {
@@ -186,7 +192,7 @@ impl AssetCache {
             let assets = assets.clone();
             runtime.spawn(async move {
                 loop {
-                    time::sleep(Duration::from_millis(1000)).await;
+                    time::sleep_label(Duration::from_millis(1000), "asset cache cleanup").await;
                     assets.clean_up_dropped();
                 }
             });
@@ -202,22 +208,45 @@ impl AssetCache {
         let loc = {
             let mut cache = self.sync.lock();
             let key = AssetKey::new(key);
-            cache.entry(key.clone()).or_insert_with(|| SyncAssetLoc { _key: key, content: Arc::new(Mutex::new(None)) }).clone()
+            cache
+                .entry(key.clone())
+                .or_insert_with(|| SyncAssetLoc {
+                    _key: key,
+                    content: Arc::new(Mutex::new(None)),
+                })
+                .clone()
         };
         let mut content = loc.content.lock();
         if content.is_none() {
             *content = Some(Arc::new(loader(self.clone())) as Arc<dyn AssetHolder>);
         }
-        content.as_ref().unwrap().as_any().downcast_ref::<T>().unwrap().clone()
+        content
+            .as_ref()
+            .unwrap()
+            .as_any()
+            .downcast_ref::<T>()
+            .unwrap()
+            .clone()
     }
 
     #[deprecated(note = "Use a SyncAssetKey instead")]
-    pub fn try_get_sync<K: Into<String>, T: Clone + Sync + Send + 'static>(&self, key: K) -> Option<T> {
+    pub fn try_get_sync<K: Into<String>, T: Clone + Sync + Send + 'static>(
+        &self,
+        key: K,
+    ) -> Option<T> {
         let cache = self.sync.lock();
         let key = AssetKey::new(key);
         if let Some(entry) = cache.get(&key) {
             let content = entry.content.lock();
-            Some(content.as_ref().unwrap().as_any().downcast_ref::<T>().unwrap().clone())
+            Some(
+                content
+                    .as_ref()
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<T>()
+                    .unwrap()
+                    .clone(),
+            )
         } else {
             None
         }
@@ -235,7 +264,13 @@ impl AssetCache {
     pub fn insert<K: Into<String>, T: Clone + Sync + Send + 'static>(&self, key: K, asset: T) {
         let key = AssetKey::new(key);
         let mut cache = self.sync.lock();
-        cache.insert(key.clone(), SyncAssetLoc { _key: key, content: Arc::new(Mutex::new(Some(Arc::new(asset) as Arc<dyn AssetHolder>))) });
+        cache.insert(
+            key.clone(),
+            SyncAssetLoc {
+                _key: key,
+                content: Arc::new(Mutex::new(Some(Arc::new(asset) as Arc<dyn AssetHolder>))),
+            },
+        );
     }
 
     fn clean_up_dropped(&self) {
@@ -251,7 +286,13 @@ impl AssetCache {
     }
 
     /// Returns a snapshot of the current state of the asset
-    pub(crate) fn content_state<T: 'static + Clone + Asset + Send + Sync, K: AsyncAssetKeyExt<T>>(&self, key: &K) -> Option<ContentState> {
+    pub(crate) fn content_state<
+        T: 'static + Clone + Asset + Send + Sync,
+        K: AsyncAssetKeyExt<T>,
+    >(
+        &self,
+        key: &K,
+    ) -> Option<ContentState> {
         let key = AssetKey::new(key.key());
         let cache = self.async_cache.lock();
 
@@ -265,7 +306,10 @@ impl AssetCache {
     }
 
     /// Returns the asset or a future for loading the asset
-    fn get_asset_future<K, T>(&self, key: K) -> Result<(AssetKey, T), Shared<Pin<Box<dyn Future<Output = LoadPayload> + Send>>>>
+    fn get_asset_future<K, T>(
+        &self,
+        key: K,
+    ) -> Result<(AssetKey, T), Shared<Pin<Box<dyn Future<Output = LoadPayload> + Send>>>>
     where
         K: 'static + Clone + AsyncAssetKey<T>,
         T: 'static + Asset + Clone + Sync + Send,
@@ -279,12 +323,15 @@ impl AssetCache {
         let asset_key = AssetKey::new(key.key());
 
         let load = || {
-            tracing::debug!("Loading asset: {asset_key:?}");
-
             // No future loading the value was found.
             //
             // Initiate the loading
-            timeline.lock().start_load(asset_key.clone(), key.long_name(), self.stack.clone(), keepalive.is_active());
+            timeline.lock().start_load(
+                asset_key.clone(),
+                key.long_name(),
+                self.stack.clone(),
+                keepalive.is_active(),
+            );
 
             let fork = self.fork(asset_key.clone());
             let drop_policy = key.drop_policy();
@@ -299,7 +346,9 @@ impl AssetCache {
             }) as BoxFuture<'static, LoadPayload>)
                 .shared();
 
-            let content = ContentState::Loading { fut: Shared::downgrade(&fut).unwrap() };
+            let content = ContentState::Loading {
+                fut: Shared::downgrade(&fut).unwrap(),
+            };
 
             // Spawn a task to keep running the shared future even if the key holder drops
             // their part of the future.
@@ -314,7 +363,7 @@ impl AssetCache {
         // Acquire or start a future for loading this asset
         let fut = match cache.entry(asset_key.clone()) {
             Entry::Occupied(mut slot) => {
-                let mut loc = slot.get_mut();
+                let loc = slot.get_mut();
 
                 match &mut loc.content {
                     ContentState::Loading { fut } => {
@@ -332,7 +381,10 @@ impl AssetCache {
                     ContentState::Loaded { value, .. } => {
                         // Loaded and referenced
 
-                        let content = value.as_any().downcast_ref::<<T as Asset>::WeakType>().unwrap();
+                        let content = value
+                            .as_any()
+                            .downcast_ref::<<T as Asset>::WeakType>()
+                            .unwrap();
                         if let Some(content) = T::from_weak(content) {
                             return Ok((asset_key, content));
                         }
@@ -357,7 +409,12 @@ impl AssetCache {
                 let (fut, content, keepalive_task) = load();
                 let key = slot.key().clone();
 
-                slot.insert(AsyncAssetLoc { key, content, keepalive_task, keepalive_guard: Weak::new() });
+                slot.insert(AsyncAssetLoc {
+                    key,
+                    content,
+                    keepalive_task,
+                    keepalive_guard: Weak::new(),
+                });
 
                 fut
             }
@@ -384,7 +441,9 @@ impl AssetCache {
         };
 
         let mut cache = self.async_cache.lock();
-        let loc = cache.get_mut(&asset_key).expect("Asset loc was removed during loading");
+        let loc = cache
+            .get_mut(&asset_key)
+            .expect("Asset loc was removed during loading");
 
         // Start or replace the keepalive task
 
@@ -395,8 +454,12 @@ impl AssetCache {
         // This is after all what RAII is all about
         //
         // Always get a fresh guard
-        let guard =
-            loc.keepalive_guard.upgrade().unwrap_or_else(|| Arc::new(KeepaliveGuard::begin(asset_key.clone(), self.timeline.clone())));
+        let guard = loc.keepalive_guard.upgrade().unwrap_or_else(|| {
+            Arc::new(KeepaliveGuard::begin(
+                asset_key.clone(),
+                self.timeline.clone(),
+            ))
+        });
         loc.keepalive_guard = Arc::downgrade(&guard);
 
         match keepalive {
@@ -406,8 +469,7 @@ impl AssetCache {
                 }
 
                 let task = self.runtime.spawn(async move {
-                    time::sleep(dur).await;
-                    tracing::debug!("Keepalive timed out for {asset_key:?}");
+                    time::sleep_label(dur, "asset keepalive").await;
                     drop((keepalive_ref, guard));
                 });
 
@@ -440,7 +502,10 @@ impl std::fmt::Debug for AssetCache {
 
 pub trait SyncAssetKey<T: Clone + Sync + Send + 'static>: Sync + Send + std::fmt::Debug {
     fn load(&self, _assets: AssetCache) -> T {
-        panic!("{} resource doesn't implement the load method", std::any::type_name::<T>())
+        panic!(
+            "{} resource doesn't implement the load method",
+            std::any::type_name::<T>()
+        )
     }
 }
 pub trait SyncAssetKeyExt<T: Clone + Sync + Send + 'static>: SyncAssetKey<T> {
@@ -472,7 +537,9 @@ impl<T: Clone + Sync + Send + 'static, K: SyncAssetKey<T>> SyncAssetKeyExt<T> fo
 }
 
 #[async_trait]
-pub trait AsyncAssetKey<T: Asset + Clone + Sync + Send + 'static>: Sync + Send + std::fmt::Debug {
+pub trait AsyncAssetKey<T: Asset + Clone + Sync + Send + 'static>:
+    Sync + Send + std::fmt::Debug
+{
     async fn load(self, assets: AssetCache) -> T;
 
     /// Adapter to make the key load in a background task.
@@ -516,7 +583,9 @@ pub trait AsyncAssetKeyExt<T: Asset + Clone + Sync + Send + 'static>: AsyncAsset
 }
 
 #[async_trait]
-impl<T: Asset + Clone + Sync + Send + 'static, K: AsyncAssetKey<T> + Clone + 'static> AsyncAssetKeyExt<T> for K {
+impl<T: Asset + Clone + Sync + Send + 'static, K: AsyncAssetKey<T> + Clone + 'static>
+    AsyncAssetKeyExt<T> for K
+{
     fn key(&self) -> String {
         format!("{self:?}")
     }
@@ -608,7 +677,9 @@ impl<T: Asset + Sync + Send> Asset for Vec<T> {
         v.iter().map(|x| T::to_weak(x)).collect()
     }
     fn from_weak(v: &Self::WeakType) -> Option<Self> {
-        v.iter().map(|x| T::from_weak(x)).collect::<Option<Vec<_>>>()
+        v.iter()
+            .map(|x| T::from_weak(x))
+            .collect::<Option<Vec<_>>>()
     }
 }
 
@@ -645,10 +716,16 @@ pub struct AssetTimeline {
 }
 impl AssetTimeline {
     pub fn is_loading(&self) -> bool {
-        self.lifetimes.last().map(|x| x.end_load.is_none() && x.aborted.is_none()).unwrap_or(false)
+        self.lifetimes
+            .last()
+            .map(|x| x.end_load.is_none() && x.aborted.is_none())
+            .unwrap_or(false)
     }
     pub fn is_aborted(&self) -> bool {
-        self.lifetimes.last().map(|x| x.aborted.is_some()).unwrap_or(false)
+        self.lifetimes
+            .last()
+            .map(|x| x.aborted.is_some())
+            .unwrap_or(false)
     }
 }
 
@@ -660,13 +737,22 @@ pub struct AssetsTimeline {
 
 impl AssetsTimeline {
     pub fn new() -> Self {
-        Self { assets: Default::default(), start_time: chrono::Utc::now() }
+        Self {
+            assets: Default::default(),
+            start_time: chrono::Utc::now(),
+        }
     }
     pub fn n_loading(&self) -> usize {
         self.assets.values().filter(|x| x.is_loading()).count()
     }
 
-    fn start_load(&mut self, key: AssetKey, long_name: String, stack: Vec<AssetKey>, keepalive: bool) {
+    fn start_load(
+        &mut self,
+        key: AssetKey,
+        long_name: String,
+        stack: Vec<AssetKey>,
+        keepalive: bool,
+    ) {
         let asset = self.assets.entry(key).or_default();
         asset.long_name = long_name;
         asset.stack = stack;
@@ -682,7 +768,12 @@ impl AssetsTimeline {
         });
     }
     fn last_lifetime(&mut self, key: &AssetKey) -> &mut AssetLifetime {
-        self.assets.get_mut(key).unwrap().lifetimes.last_mut().unwrap()
+        self.assets
+            .get_mut(key)
+            .unwrap()
+            .lifetimes
+            .last_mut()
+            .unwrap()
     }
     fn end_load(&mut self, key: &AssetKey, cpu_size: Option<u64>, gpu_size: Option<u64>) {
         let asset = self.assets.get_mut(key).unwrap();
@@ -763,13 +854,21 @@ where
 
             // Update the content state
             let mut cache = p.cache.lock();
-            let mut loc = cache.get_mut(p.asset_key).expect("Asset loc was removed during loading");
+            let loc = cache
+                .get_mut(p.asset_key)
+                .expect("Asset loc was removed during loading");
 
             // Replace the loading state with the loaded state
             assert!(loc.content.is_loading());
-            loc.content = ContentState::Loaded { value: weak_res, check_alive };
+            loc.content = ContentState::Loaded {
+                value: weak_res,
+                check_alive,
+            };
 
-            Poll::Ready(LoadPayload { asset_key: p.asset_key.clone(), strong: value })
+            Poll::Ready(LoadPayload {
+                asset_key: p.asset_key.clone(),
+                strong: value,
+            })
         } else {
             Poll::Pending
         }
@@ -781,10 +880,30 @@ impl<F, K> PinnedDrop for AssetLoadFuture<F, K> {
     fn drop(self: Pin<&mut Self>) {
         if !self.completed {
             let mut cache = self.cache.lock();
-            let loc = cache.get_mut(&self.asset_key).expect("Asset loc was removed during loading");
+            let loc = cache
+                .get_mut(&self.asset_key)
+                .expect("Asset loc was removed during loading");
             assert!(loc.content.is_loading());
             loc.content = ContentState::Aborted;
         }
+    }
+}
+
+struct KeepaliveGuard {
+    key: AssetKey,
+    timeline: Arc<Mutex<AssetsTimeline>>,
+}
+
+impl KeepaliveGuard {
+    fn begin(key: AssetKey, timeline: Arc<Mutex<AssetsTimeline>>) -> Self {
+        timeline.lock().keepalive_start(&key);
+        Self { key, timeline }
+    }
+}
+
+impl Drop for KeepaliveGuard {
+    fn drop(&mut self) {
+        self.timeline.lock().keepalive_end(&self.key)
     }
 }
 
@@ -817,7 +936,11 @@ mod test {
     async fn load_aborted() {
         let assets = AssetCache::new(runtime::Handle::current());
 
-        let asset = timeout(Duration::from_millis(200), TestAssetKey { name: "foo".into() }.get(&assets)).await;
+        let asset = timeout(
+            Duration::from_millis(200),
+            TestAssetKey { name: "foo".into() }.get(&assets),
+        )
+        .await;
 
         assert!(asset.is_err());
 
@@ -826,7 +949,7 @@ mod test {
         assert!(matches!(state, Some(ContentState::Aborted)));
 
         let state = assets.content_state(&TestAssetKey { name: "bar".into() });
-        assert!(matches!(state, None));
+        assert!(state.is_none());
 
         let asset = TestAssetKey { name: "foo".into() }.get(&assets).await;
 
@@ -876,23 +999,5 @@ mod test {
             let val = Key.get(&assets).await.unwrap_err();
             assert_eq!(val, 3);
         }
-    }
-}
-
-struct KeepaliveGuard {
-    key: AssetKey,
-    timeline: Arc<Mutex<AssetsTimeline>>,
-}
-
-impl KeepaliveGuard {
-    fn begin(key: AssetKey, timeline: Arc<Mutex<AssetsTimeline>>) -> Self {
-        timeline.lock().keepalive_start(&key);
-        Self { key, timeline }
-    }
-}
-
-impl Drop for KeepaliveGuard {
-    fn drop(&mut self) {
-        self.timeline.lock().keepalive_end(&self.key)
     }
 }

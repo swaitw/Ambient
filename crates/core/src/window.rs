@@ -1,25 +1,44 @@
-use ambient_ecs::{components, Component, ComponentValue, Debuggable, Description, MaybeResource, Name, Networked, Resource, World};
-use ambient_std::math::interpolate;
-use glam::{uvec2, vec2, UVec2, Vec2};
+use ambient_ecs::{components, Description, Name, Resource, World};
+use ambient_native_std::math::interpolate;
+use glam::{uvec2, vec2, UVec2, Vec2, Vec3, Vec3Swizzles};
 use winit::window::{CursorGrabMode, CursorIcon, Window};
+
+pub use ambient_ecs::generated::app::components::{
+    cursor_position, window_logical_size, window_physical_size, window_scale_factor,
+};
 
 components!("app", {
     @[Resource, Name["Window Control"], Description["Allows controlling the window from afar."]]
     window_ctl: flume::Sender<WindowCtl>,
-
-    @[MaybeResource, Debuggable, Networked, Name["Window scale factor"], Description["The DPI/pixel scale factor of the window.\nOn standard displays, this is 1, but it can be higher on high-DPI displays like Apple Retina displays."]]
-    window_scale_factor: f64,
-    @[MaybeResource, Debuggable, Networked, Name["Window logical size"], Description["The logical size is the physical size divided by the scale factor."]]
-    window_logical_size: UVec2,
-    @[MaybeResource, Debuggable, Networked, Name["Window physical size"], Description["The physical size is the actual number of pixels on the screen."]]
-    window_physical_size: UVec2,
-    @[MaybeResource, Debuggable, Networked, Name["Cursor position"], Description["Absolute mouse cursor position in screen-space."]]
-    cursor_position: Vec2,
 });
 
+pub fn set_cursor(world: &World, cursor: CursorIcon) {
+    world
+        .resource(window_ctl())
+        .send(WindowCtl::SetCursorIcon(cursor))
+        .ok();
+}
+
 pub fn screen_to_clip_space(world: &World, screen_pos: Vec2) -> Vec2 {
-    let screen_size = *world.resource(window_physical_size());
-    interpolate(screen_pos, Vec2::ZERO, screen_size.as_vec2(), vec2(-1., 1.), vec2(1., -1.))
+    let screen_size = *world.resource(window_logical_size());
+    interpolate(
+        screen_pos,
+        Vec2::ZERO,
+        screen_size.as_vec2(),
+        vec2(-1., 1.),
+        vec2(1., -1.),
+    )
+}
+pub fn clip_to_screen_space(world: &World, clip_pos: Vec3) -> Vec3 {
+    let screen_size = *world.resource(window_logical_size());
+    interpolate(
+        clip_pos.xy(),
+        vec2(-1., 1.),
+        vec2(1., -1.),
+        Vec2::ZERO,
+        screen_size.as_vec2(),
+    )
+    .extend(clip_pos.z)
 }
 pub fn get_mouse_clip_space_position(world: &World) -> Vec2 {
     let mouse_position = *world.resource(cursor_position());
@@ -32,25 +51,21 @@ pub fn get_window_sizes(window: &Window) -> (UVec2, UVec2, f64) {
     (size, (size.as_dvec2() / sf).as_uvec2(), sf)
 }
 
-pub fn mirror_window_components(src: &mut World, dst: &mut World) {
-    fn t<T>(src: &mut World, dst: &mut World, component: Component<T>)
-    where
-        T: ComponentValue + std::fmt::Debug + Copy + PartialEq,
-    {
-        let val = *src.resource(component);
-        dst.set_if_changed(dst.resource_entity(), component, val).unwrap();
-    }
-
-    t(src, dst, window_physical_size());
-    t(src, dst, window_logical_size());
-    t(src, dst, window_scale_factor());
-    t(src, dst, cursor_position());
-}
-
 /// Allows controlling the window
 #[derive(Debug, Clone)]
 pub enum WindowCtl {
     GrabCursor(CursorGrabMode),
     SetCursorIcon(CursorIcon),
     ShowCursor(bool),
+    SetTitle(String),
+    SetFullscreen(bool),
+    ExitProcess(ExitStatus),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ExitStatus(i32);
+
+impl ExitStatus {
+    pub const SUCCESS: Self = ExitStatus(0);
+    pub const FAILURE: Self = ExitStatus(1);
 }

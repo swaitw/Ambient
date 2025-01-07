@@ -1,6 +1,6 @@
 use std::{collections::HashSet, sync::Arc};
 
-use ambient_std::asset_url::{AbsAssetUrl, AssetType};
+use ambient_native_std::asset_url::{AbsAssetUrl, AssetType};
 
 #[derive(Debug, Clone)]
 pub enum OutAssetContent {
@@ -10,6 +10,13 @@ pub enum OutAssetContent {
 impl OutAssetContent {
     pub fn is_collection(&self) -> bool {
         matches!(self, OutAssetContent::Collection(..))
+    }
+
+    pub fn as_content(&self) -> Option<&AbsAssetUrl> {
+        match self {
+            Self::Content(v) => Some(v),
+            _ => None,
+        }
     }
 }
 
@@ -30,13 +37,18 @@ pub struct OutAsset {
     pub name: String,
     pub tags: Vec<String>,
     /// Each entry in the vec is a category level, i.e.:
-    /// self.categories[0].insert("Vehicles");
-    /// self.categories[1].insert("Vehicles > Cars");
+    /// `self.categories[0].insert("Vehicles");`
+    /// `self.categories[1].insert("Vehicles > Cars");`
     pub categories: [HashSet<String>; 3],
     pub preview: OutAssetPreview,
     pub content: OutAssetContent,
     pub source: Option<AbsAssetUrl>,
 }
 pub fn asset_id_from_url(url: &AbsAssetUrl) -> String {
-    slugify::slugify(&format!("{}{}", url.0.host_str().unwrap_or(""), url.0.path()), "", "_", None)
+    slugify::slugify(
+        &format!("{}{}", url.0.host_str().unwrap_or(""), url.0.path()),
+        "",
+        "_",
+        None,
+    )
 }

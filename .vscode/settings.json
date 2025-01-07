@@ -4,5 +4,6 @@
   "files.trimTrailingWhitespace": true,
   "[toml]": {
     "editor.formatOnSave": false
-  }
+  },
+  "rust-analyzer.showUnlinkedFileNotification": false
 }

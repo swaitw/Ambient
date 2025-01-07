@@ -1,36 +1,33 @@
-use ambient_api::prelude::*;
-use ambient_cb::cb;
-use ambient_element::{element_component, Element, ElementComponentExt, Hooks};
-use ambient_guest_bridge::components::{
-    layout::{min_width, space_between_items, width},
-    transform::translation,
-};
-use ambient_ui_components::{
-    default_theme::STREET,
-    editor::{Editor, F32Input, ListEditor, MinimalListEditor, TextEditor},
-    layout::{FlowColumn, FlowRow},
-    select::DropdownSelect,
-    setup_ui_camera,
-    text::Text,
-    FocusRoot, UIExt,
+use ambient_api::{
+    core::layout::components::{min_width, space_between_items, width},
+    element::use_state,
+    prelude::*,
 };
 use indexmap::IndexMap;
 
+pub mod packages;
+
+#[main]
+pub fn main() {
+    App.el().spawn_interactive();
+}
+
 #[element_component]
 fn App(hooks: &mut Hooks) -> Element {
-    let (text, set_text) = hooks.use_state("Enter some text".to_string());
-    let (float, set_float) = hooks.use_state(0.0);
-    let (vector3, set_vector3) = hooks.use_state(Vec3::ZERO);
-    let (index_map, set_index_map) = hooks.use_state(
+    let (text, set_text) = use_state(hooks, "Enter some text".to_string());
+    let (float, set_float) = use_state(hooks, 0.0);
+    let (vector3, set_vector3) = use_state(hooks, Vec3::ZERO);
+    let (index_map, set_index_map) = use_state(
+        hooks,
         vec![("First".to_string(), "Second".to_string())]
             .into_iter()
             .collect::<IndexMap<String, String>>(),
     );
-    let (list, set_list) = hooks.use_state(vec!["First".to_string(), "Second".to_string()]);
+    let (list, set_list) = use_state(hooks, vec!["First".to_string(), "Second".to_string()]);
     let (minimal_list, set_minimal_list) =
-        hooks.use_state(vec!["First".to_string(), "Second".to_string()]);
-    let row = |name, editor| FlowRow(vec![Text::el(name).set(min_width(), 110.), editor]).el();
-    FocusRoot(vec![FlowColumn(vec![
+        use_state(hooks, vec!["First".to_string(), "Second".to_string()]);
+    let row = |name, editor| FlowRow::el(vec![Text::el(name).with(min_width(), 110.), editor]);
+    FlowColumn::el([
         row("TextEditor", TextEditor::new(text, set_text).el()),
         row(
             "F32Input",
@@ -78,18 +75,7 @@ fn App(hooks: &mut Hooks) -> Element {
             .el(),
         ),
     ])
-    .el()
-    .set(translation(), vec3(200., 200., 0.))
-    .set(width(), 200.)
-    .set(space_between_items(), STREET)
-    .with_padding_even(STREET)])
-    .el()
-}
-
-#[main]
-pub async fn main() -> EventResult {
-    setup_ui_camera();
-    App.el().spawn_interactive();
-
-    EventOk
+    .with(width(), 200.)
+    .with(space_between_items(), STREET)
+    .with_padding_even(STREET)
 }

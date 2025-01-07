@@ -1,6 +1,7 @@
 #[macro_use]
 extern crate closure;
-use std::{f32::consts::PI, num::NonZeroU32, sync::Arc};
+use ambient_element::{use_effect, use_frame, use_memo_with, use_state_with};
+use std::{f32::consts::PI, str::FromStr, sync::Arc};
 
 use ambient_core::{
     asset_cache,
@@ -15,41 +16,46 @@ use ambient_core::{
 };
 use ambient_ecs::{components, query, Commands, Entity, EntityId, FnSystem, SystemGroup, World};
 use ambient_editor_derive::ElementEditor;
-use ambient_element::{element_tree, render_parented_with_component, Element, ElementComponent, ElementComponentExt, Group, Hooks};
+use ambient_element::{
+    element_tree, render_parented_with_component, use_state, Element, ElementComponent,
+    ElementComponentExt, Group, Hooks,
+};
 use ambient_gpu::{
     fill::FillerKey,
-    gpu::GpuKey,
+    gpu::{Gpu, GpuKey},
     mesh_buffer::GpuMesh,
     std_assets::PixelTextureKey,
     texture::{Texture, TextureReader},
     texture_loaders::TextureFromUrl,
 };
 use ambient_meshes::{GridMesh, GridMeshKey};
+use ambient_native_std::{
+    asset_cache::{Asset, AssetCache, AsyncAssetKeyExt, SyncAssetKey, SyncAssetKeyExt},
+    asset_url::AbsAssetUrl,
+    cb, friendly_id, log_result,
+    shapes::{Sphere, AABB},
+};
 use ambient_physics::{
     collider::{collider_type, ColliderType},
     main_physics_scene,
     physx::{character_controller, physics, physics_shape, rigid_static, Physics},
     PxActorUserData, PxShapeUserData,
 };
-use ambient_renderer::{cast_shadows, color, gpu_primitives, lod::cpu_lod, material, primitives, renderer_shader, SharedMaterial};
-use ambient_std::{
-    asset_cache::{Asset, AssetCache, AsyncAssetKeyExt, SyncAssetKey, SyncAssetKeyExt},
-    asset_url::AbsAssetUrl,
-    cb, friendly_id, log_result,
-    shapes::{Sphere, AABB},
+use ambient_renderer::{
+    cast_shadows, color, gpu_primitives_lod, gpu_primitives_mesh, lod::cpu_lod, material,
+    primitives, renderer_shader, SharedMaterial,
 };
 use glam::{vec2, vec3, vec4, IVec2, Mat4, Quat, UVec2, Vec2, Vec3, Vec3Swizzles, Vec4};
 use itertools::Itertools;
 use ndarray::{s, Array3, ArrayView3, Axis};
 use physxx::{
-    AsPxActor, AsPxRigidActor, PxActor, PxActorFlag, PxHeightFieldDesc, PxHeightFieldGeometry, PxMaterial, PxPhysicsRef,
-    PxQuantizedHeightFieldSamples, PxRigidActor, PxRigidStaticRef, PxShapeFlag, PxTransform, PxUserData,
+    AsPxActor, AsPxRigidActor, PxActor, PxActorFlag, PxHeightFieldDesc, PxHeightFieldGeometry,
+    PxMaterial, PxPhysicsRef, PxQuantizedHeightFieldSamples, PxRigidActor, PxRigidStaticRef,
+    PxShapeFlag, PxTransform, PxUserData,
 };
 use serde::{Deserialize, Serialize};
 pub use terrain_shader::*;
 use tracing::info_span;
-
-use crate::terrain_shader::{TerrainMaterial, TerrainMaterialParams};
 
 pub mod brushes;
 mod gather_spread;
@@ -85,20 +91,28 @@ pub fn init_all_components() {
 }
 
 pub const TERRAIN_BASE: f32 = -30.;
-pub(crate) static OLD_CONTENT_SERVER_URL: &str = "https://fra1.digitaloceanspaces.com/dims-content/";
+pub(crate) static OLD_CONTENT_SERVER_URL: &str =
+    "https://fra1.digitaloceanspaces.com/dims-content/";
 
 pub fn get_terrain_cell(world: &World, cell: IVec2) -> Option<EntityId> {
-    query((terrain_world_cell(),)).iter(world, None).find(|(_, (c,))| **c == cell).map(|(id, _)| id)
+    query((terrain_world_cell(),))
+        .iter(world, None)
+        .find(|(_, (c,))| **c == cell)
+        .map(|(id, _)| id)
 }
 
-pub fn spawn_terrain(world: &mut World, terrain_compressed: Arc<TerrainStateCpu>, cell: IVec2) -> EntityId {
+pub fn spawn_terrain(
+    world: &mut World,
+    terrain_compressed: Arc<TerrainStateCpu>,
+    cell: IVec2,
+) -> EntityId {
     let position = (cell.as_vec2() * TerrainSize::new().size_in_meters()).extend(TERRAIN_BASE);
 
     Entity::new()
         .with(scale(), Vec3::ONE)
         .with(rotation(), Quat::IDENTITY)
         .with(translation(), position)
-        .with_default(local_to_world())
+        .with(local_to_world(), Default::default())
         .with(collider_type(), ColliderType::Static)
         .with(terrain_state_cpu(), terrain_compressed)
         .with(name(), "Terrain".to_string())
@@ -107,12 +121,19 @@ pub fn spawn_terrain(world: &mut World, terrain_compressed: Arc<TerrainStateCpu>
         .spawn(world)
 }
 
-fn create_terrain_physics(world: &World, terrain_state: Arc<TerrainStateCpu>, position: Vec3, _cell: IVec2) -> PxRigidStaticRef {
+fn create_terrain_physics(
+    world: &World,
+    terrain_state: Arc<TerrainStateCpu>,
+    position: Vec3,
+    _cell: IVec2,
+) -> PxRigidStaticRef {
     let scene = world.resource(main_physics_scene());
     let physics = world.resource(physics());
     let physics_material = PxTerrainMaterialKey.get(world.resource(asset_cache()));
     let actor = px_rigid_static_from_heightmap(physics, physics_material, &terrain_state.heightmap);
-    actor.as_actor().set_user_data(PxActorUserData { serialize: false });
+    actor
+        .as_actor()
+        .set_user_data(PxActorUserData { serialize: false });
     actor.set_actor_flag(PxActorFlag::VISUALIZATION, false);
     actor.get_shapes()[0].set_flag(PxShapeFlag::VISUALIZATION, false);
     actor.get_shapes()[0].set_flag(PxShapeFlag::SCENE_QUERY_SHAPE, true);
@@ -125,12 +146,16 @@ pub fn terrain_gpu_to_cpu_system() -> SystemGroup {
     SystemGroup::new(
         "dims/terrain/terrain_gpu_to_cpu_system",
         vec![
-            query((terrain_state_cpu(),)).excl(terrain_state()).to_system(|q, world, qs, _| {
-                for (id, (state,)) in q.collect_cloned(world, qs) {
-                    let state = state.to_gpu(world.resource(asset_cache()).clone());
-                    world.add_component(id, terrain_state(), state.clone()).ok();
-                }
-            }),
+            query((terrain_state_cpu(),))
+                .excl(terrain_state())
+                .to_system(|q, world, qs, _| {
+                    for (id, (state,)) in q.collect_cloned(world, qs) {
+                        let asset_cache = world.resource(asset_cache());
+                        let gpu = GpuKey.get(asset_cache);
+                        let state = state.to_gpu(&gpu, asset_cache);
+                        world.add_component(id, terrain_state(), state.clone()).ok();
+                    }
+                }),
             Box::new(FixedTimestepSystem::new(
                 1.,
                 Box::new(FnSystem::new(|world, _| {
@@ -141,16 +166,22 @@ pub fn terrain_gpu_to_cpu_system() -> SystemGroup {
 
                     let async_run = world.resource(async_run()).clone();
                     let runtime = world.resource(runtime()).clone();
+                    let asset_cache = world.resource(asset_cache()).clone();
                     for id in to_update {
                         world.set(id, terrain_cell_needs_cpu_download(), false).ok();
                         if let Ok(terrain) = world.get_ref(id, terrain_state()) {
-                            let terrain = terrain.reader();
+                            let gpu = GpuKey.get(&asset_cache);
+                            let terrain = terrain.reader(&gpu);
                             let async_run = async_run.clone();
                             runtime.spawn(async move {
-                                let terrain = Arc::new(terrain.read().await.unwrap());
+                                let terrain = Arc::new(terrain.read(&gpu).await.unwrap());
                                 async_run.run(move |world| {
                                     log_result!(world.set(id, terrain_state_cpu(), terrain));
-                                    log_result!(world.add_component(id, terrain_should_send_to_server(), Some(Instant::now())));
+                                    log_result!(world.add_component(
+                                        id,
+                                        terrain_should_send_to_server(),
+                                        Some(Instant::now())
+                                    ));
                                     // async_commands.add_component(id, outline_recursive(), vec4(0.5, 0.5, 1., 1.));
                                 });
                             });
@@ -166,72 +197,95 @@ pub fn server_systems() -> SystemGroup {
     SystemGroup::new(
         "dims/terrain/server_systems",
         vec![
-            query((terrain_state_cpu().changed(), translation(), terrain_world_cell())).to_system_with_name(
-                "terrain",
+            query((
+                terrain_state_cpu().changed(),
+                translation(),
+                terrain_world_cell(),
+            ))
+            .to_system_with_name("terrain", |q, world, qs, _| {
+                let updated = q.collect_cloned(world, qs);
+                let missing = query((terrain_state_cpu(), translation(), terrain_world_cell()))
+                    .excl(physics_shape())
+                    .collect_cloned(world, None);
+                let all = updated
+                    .into_iter()
+                    .chain(missing.into_iter())
+                    .sorted_by_key(|x| x.0)
+                    .dedup_by(|x, y| x.0 == y.0)
+                    .collect_vec();
+                for (id, (state, position, cell)) in all {
+                    if let Ok(actor) = world.get_ref(id, rigid_static()) {
+                        if let Some(scene) = actor.get_scene() {
+                            scene.remove_actor(actor, false);
+                            for shape in actor.get_shapes() {
+                                shape.remove_user_data::<PxShapeUserData>();
+                            }
+                            actor.as_actor().remove_user_data::<PxActorUserData>();
+                            actor.release();
+                        }
+                    }
+                    let body = create_terrain_physics(world, state.clone(), position, cell);
+                    body.get_shapes()[0].set_user_data(PxShapeUserData {
+                        entity: id,
+                        ..Default::default()
+                    });
+
+                    world
+                        .add_components(
+                            id,
+                            Entity::new()
+                                .with(physics_shape(), body.get_shapes()[0].clone())
+                                .with(rigid_static(), body)
+                                .with(collider_type(), ColliderType::Static),
+                        )
+                        .unwrap();
+                }
+            }),
+            query((translation(), character_controller())).to_system_with_name(
+                "character",
                 |q, world, qs, _| {
-                    let updated = q.collect_cloned(world, qs);
-                    let missing =
-                        query((terrain_state_cpu(), translation(), terrain_world_cell())).excl(physics_shape()).collect_cloned(world, None);
-                    let all =
-                        updated.into_iter().chain(missing.into_iter()).sorted_by_key(|x| x.0).dedup_by(|x, y| x.0 == y.0).collect_vec();
-                    for (id, (state, position, cell)) in all {
-                        if let Ok(actor) = world.get_ref(id, rigid_static()) {
-                            if let Some(scene) = actor.get_scene() {
-                                scene.remove_actor(actor, false);
-                                for shape in actor.get_shapes() {
-                                    shape.remove_user_data::<PxShapeUserData>();
-                                }
-                                actor.as_actor().remove_user_data::<PxActorUserData>();
-                                actor.release();
+                    for (_id, (pos, controller)) in q.iter(world, qs) {
+                        if let Some(height) = get_terrain_height(world, pos.xy()) {
+                            if pos.z < height - 0.5 {
+                                controller.set_position(pos.xy().extend(height + 1.).as_dvec3());
                             }
                         }
-                        let body = create_terrain_physics(world, state.clone(), position, cell);
-                        body.get_shapes()[0].set_user_data(PxShapeUserData { entity: id, ..Default::default() });
-
-                        world
-                            .add_components(
-                                id,
-                                Entity::new()
-                                    .with(physics_shape(), body.get_shapes()[0].clone())
-                                    .with(rigid_static(), body)
-                                    .with(collider_type(), ColliderType::Static),
-                            )
-                            .unwrap();
                     }
                 },
             ),
-            query((translation(), character_controller())).to_system_with_name("character", |q, world, qs, _| {
-                for (_id, (pos, controller)) in q.iter(world, qs) {
-                    if let Some(height) = get_terrain_height(world, pos.xy()) {
-                        if pos.z < height - 0.5 {
-                            controller.set_position(pos.xy().extend(height + 1.).as_dvec3());
-                        }
-                    }
-                }
-            }),
-            query((terrain_state_cpu().changed(), translation())).to_system_with_name("raise_objects", |q, world, qs, _| {
-                let mut new_transform = Vec::new();
+            query((terrain_state_cpu().changed(), translation())).to_system_with_name(
+                "raise_objects",
+                |q, world, qs, _| {
+                    let mut new_transform = Vec::new();
 
-                for (cell, (state, cell_pos)) in q.iter(world, qs) {
-                    let _span = info_span!("raise_objects", ?cell, ?cell_pos).entered();
-                    for (id, (pos, rot, scale, offset)) in query((translation(), rotation(), scale(), snap_to_ground())).iter(world, None) {
-                        if state.contains(cell_pos.xy(), pos.xy()) {
-                            // Move the entity or attachment position up to the new position
-                            if let Some(height) = state.get_height(pos.xy() - cell_pos.xy()) {
-                                let new_pos = vec3(pos.x, pos.y, height + cell_pos.z + offset);
-                                tracing::info!(height, ?new_pos, "Moving entity {id} out of terrain");
-                                new_transform.push((id, *pos, new_pos, *rot, *scale));
+                    for (cell, (state, cell_pos)) in q.iter(world, qs) {
+                        let _span = info_span!("raise_objects", ?cell, ?cell_pos).entered();
+                        for (id, (pos, rot, scale, offset)) in
+                            query((translation(), rotation(), scale(), snap_to_ground()))
+                                .iter(world, None)
+                        {
+                            if state.contains(cell_pos.xy(), pos.xy()) {
+                                // Move the entity or attachment position up to the new position
+                                if let Some(height) = state.get_height(pos.xy() - cell_pos.xy()) {
+                                    let new_pos = vec3(pos.x, pos.y, height + cell_pos.z + offset);
+                                    tracing::info!(
+                                        height,
+                                        ?new_pos,
+                                        "Moving entity {id} out of terrain"
+                                    );
+                                    new_transform.push((id, *pos, new_pos, *rot, *scale));
+                                }
                             }
                         }
                     }
-                }
 
-                for (id, _, pos, rot, scl) in new_transform {
-                    world.set_if_changed(id, translation(), pos).unwrap();
-                    world.set_if_changed(id, rotation(), rot).unwrap();
-                    world.set_if_changed(id, scale(), scl).unwrap();
-                }
-            }),
+                    for (id, _, pos, rot, scl) in new_transform {
+                        world.set_if_changed(id, translation(), pos).unwrap();
+                        world.set_if_changed(id, rotation(), rot).unwrap();
+                        world.set_if_changed(id, scale(), scl).unwrap();
+                    }
+                },
+            ),
         ],
     )
 }
@@ -241,16 +295,26 @@ pub fn client_systems() -> SystemGroup {
         "dims/terrain/client_systems",
         vec![
             Box::new(intents::terrain_intent_client_system()),
-            query((terrain_world_cell(),)).excl(terrain_state_cpu()).to_system(|q, world, qs, _| {
-                for (id, _) in q.collect_cloned(world, qs) {
-                    world.add_component(id, terrain_state_cpu(), Arc::new(TerrainStateCpu::empty())).ok();
-                }
-            }),
-            query((terrain_world_cell(),)).excl(terrain_cell_version()).to_system(|q, world, qs, _| {
-                for (id, _) in q.collect_cloned(world, qs) {
-                    world.add_component(id, terrain_cell_version(), 0).ok();
-                }
-            }),
+            query((terrain_world_cell(),))
+                .excl(terrain_state_cpu())
+                .to_system(|q, world, qs, _| {
+                    for (id, _) in q.collect_cloned(world, qs) {
+                        world
+                            .add_component(
+                                id,
+                                terrain_state_cpu(),
+                                Arc::new(TerrainStateCpu::empty()),
+                            )
+                            .ok();
+                    }
+                }),
+            query((terrain_world_cell(),))
+                .excl(terrain_cell_version())
+                .to_system(|q, world, qs, _| {
+                    for (id, _) in q.collect_cloned(world, qs) {
+                        world.add_component(id, terrain_cell_version(), 0).ok();
+                    }
+                }),
             Box::new(terrain_gpu_to_cpu_system()),
             query((terrain_state().changed(), translation())).to_system(|q, world, qs, _| {
                 for (id, (state, pos)) in q.collect_cloned(world, qs) {
@@ -258,44 +322,79 @@ pub fn client_systems() -> SystemGroup {
                         world,
                         id,
                         element_tree(),
-                        Group(vec![Terrain { state: state.clone(), heightmap_position: pos.xy() }.el().set_default(local_to_parent())])
-                            .el(),
+                        Group(vec![Terrain {
+                            state: state.clone(),
+                            heightmap_position: pos.xy(),
+                        }
+                        .el()
+                        .with(local_to_parent(), Default::default())])
+                        .el(),
                     );
                 }
             }),
-            query((terrain_lods(), cpu_lod(), local_to_world(), terrain_cell_bounding(), terrain_lod_factor(), terrain_cell_diagonal()))
-                .incl(terrain_cell())
-                .to_system(|q, world, qs, _| {
-                    profiling::scope!("terrain.lod");
-                    if let Some(main_camera) = get_active_camera(world, main_scene(), world.resource_opt(local_user_id())) {
-                        let pw = world.get(main_camera, projection_view()).unwrap_or(Mat4::IDENTITY);
-                        let camera_position = pw.inverse().project_point3(vec3(0., 0., -1.));
+            query((
+                terrain_lods(),
+                cpu_lod(),
+                local_to_world(),
+                terrain_cell_bounding(),
+                terrain_lod_factor(),
+                terrain_cell_diagonal(),
+            ))
+            .incl(terrain_cell())
+            .to_system(|q, world, qs, _| {
+                profiling::scope!("terrain.lod");
+                if let Some(main_camera) =
+                    get_active_camera(world, main_scene(), world.resource_opt(local_user_id()))
+                {
+                    let pw = world
+                        .get(main_camera, projection_view())
+                        .unwrap_or(Mat4::IDENTITY);
+                    let camera_position = pw.inverse().project_point3(vec3(0., 0., -1.));
 
-                        let mut commands = Commands::new();
-                        for (id, (lods, &current_lod, &local_to_world, bounding, &lod_factor, &cell_diagonal)) in q.iter(world, qs) {
-                            let world_bounding = bounding.transform(&local_to_world);
-                            let dist_from_camera = (world_bounding.center - camera_position).length() - world_bounding.radius;
-                            let lod_base = (dist_from_camera.sqrt() * lod_factor).floor();
-                            let lod_start = (lod_base / lod_factor).powf(2.);
-                            let lod_dist = dist_from_camera - lod_start;
-                            let min_lod = if lod_dist <= cell_diagonal { (lod_base as i32 - 1).max(0) as usize } else { lod_base as usize };
+                    let mut commands = Commands::new();
+                    for (
+                        id,
+                        (
+                            lods,
+                            &current_lod,
+                            &local_to_world,
+                            bounding,
+                            &lod_factor,
+                            &cell_diagonal,
+                        ),
+                    ) in q.iter(world, qs)
+                    {
+                        let world_bounding = bounding.transform(&local_to_world);
+                        let dist_from_camera = (world_bounding.center - camera_position).length()
+                            - world_bounding.radius;
+                        let lod_base = (dist_from_camera.sqrt() * lod_factor).floor();
+                        let lod_start = (lod_base / lod_factor).powf(2.);
+                        let lod_dist = dist_from_camera - lod_start;
+                        let min_lod = if lod_dist <= cell_diagonal {
+                            (lod_base as i32 - 1).max(0) as usize
+                        } else {
+                            lod_base as usize
+                        };
 
-                            let new_lod = min_lod.min(lods.len() - 1);
+                        let new_lod = min_lod.min(lods.len() - 1);
 
-                            if new_lod != current_lod {
-                                commands.set(id, mesh(), lods[new_lod].clone());
-                                commands.set(id, cpu_lod(), new_lod);
-                            }
+                        if new_lod != current_lod {
+                            commands.set(id, mesh(), lods[new_lod].clone());
+                            commands.set(id, cpu_lod(), new_lod);
                         }
-                        commands.apply(world).unwrap();
                     }
-                }),
+                    commands.apply(world).unwrap();
+                }
+            }),
         ],
     )
 }
 
 pub fn ray_terrain_intersection(world: &World, origin: Vec3, dir: Vec3) -> Option<f32> {
-    for (_, (rigid_static,)) in query((rigid_static(),)).incl(terrain_state_cpu()).iter(world, None) {
+    for (_, (rigid_static,)) in query((rigid_static(),))
+        .incl(terrain_state_cpu())
+        .iter(world, None)
+    {
         let shapes = rigid_static.get_shapes();
         let geom = shapes[0].get_geometry();
         let hits = physxx::raycast(
@@ -324,14 +423,19 @@ pub fn get_terrain_height(world: &World, pos: Vec2) -> Option<f32> {
 }
 
 /// Find the terrain cell which contains the point
-pub fn find_terrain_cell(world: &World, point: Vec2) -> Option<(EntityId, Vec3, &Arc<TerrainStateCpu>)> {
-    query((translation(), terrain_state_cpu())).iter(world, None).find_map(|(id, (pos, state))| {
-        if state.contains(pos.xy(), point) {
-            Some((id, *pos, state))
-        } else {
-            None
-        }
-    })
+pub fn find_terrain_cell(
+    world: &World,
+    point: Vec2,
+) -> Option<(EntityId, Vec3, &Arc<TerrainStateCpu>)> {
+    query((translation(), terrain_state_cpu()))
+        .iter(world, None)
+        .find_map(|(id, (pos, state))| {
+            if state.contains(pos.xy(), point) {
+                Some((id, *pos, state))
+            } else {
+                None
+            }
+        })
 }
 
 pub fn get_terrain_height_blerp(world: &World, point: Vec2) -> Option<f32> {
@@ -357,12 +461,17 @@ pub struct TerrainSize {
 }
 impl Default for TerrainSize {
     fn default() -> Self {
-        Self { lods: 4, base_polygons: 8 }
+        Self {
+            lods: 4,
+            base_polygons: 8,
+        }
     }
 }
 impl TerrainSize {
     pub fn new() -> Self {
-        Self { ..Default::default() }
+        Self {
+            ..Default::default()
+        }
     }
     pub fn polygons_at_lod(&self, lod: usize) -> usize {
         let lod_max = self.lods - 1;
@@ -372,10 +481,18 @@ impl TerrainSize {
         self.polygons_at_lod(0) + 1
     }
     pub fn heightmap_extent(&self) -> wgpu::Extent3d {
-        wgpu::Extent3d { width: self.texture_size() as u32, height: self.texture_size() as u32, depth_or_array_layers: TERRAIN_LAYERS }
+        wgpu::Extent3d {
+            width: self.texture_size() as u32,
+            height: self.texture_size() as u32,
+            depth_or_array_layers: TERRAIN_LAYERS,
+        }
     }
     pub fn normalmap_extent(&self) -> wgpu::Extent3d {
-        wgpu::Extent3d { width: self.texture_size() as u32, height: self.texture_size() as u32, depth_or_array_layers: 1 }
+        wgpu::Extent3d {
+            width: self.texture_size() as u32,
+            height: self.texture_size() as u32,
+            depth_or_array_layers: 1,
+        }
     }
     pub fn polygon_size(&self) -> usize {
         self.polygons_at_lod(0)
@@ -413,26 +530,63 @@ pub enum TerrainLayers {
 
 pub fn wgsl_terrain_preprocess(source: impl Into<String>) -> String {
     wgsl_terrain_consts(source)
-        .replace("#TERRAIN_FUNCS", &wgsl_terrain_consts(include_str!("terrain_funcs.wgsl")))
-        .replace("#GET_HARDNESS", &wgsl_terrain_consts(include_str!("brushes/get_hardness.wgsl")))
+        .replace(
+            "TERRAIN_FUNCS",
+            &wgsl_terrain_consts(include_str!("terrain_funcs.wgsl")),
+        )
+        .replace(
+            "GET_HARDNESS",
+            &wgsl_terrain_consts(include_str!("brushes/get_hardness.wgsl")),
+        )
 }
+
 fn wgsl_terrain_consts(source: impl Into<String>) -> String {
     let source: String = source.into();
     source
-        .replace("#ROCK_LAYER", &(TerrainLayers::Rock as usize).to_string())
-        .replace("#SOIL_LAYER", &(TerrainLayers::Soil as usize).to_string())
-        .replace("#SEDIMENT_LAYER", &(TerrainLayers::Sediment as usize).to_string())
-        .replace("#WATER_LAYER", &(TerrainLayers::Water as usize).to_string())
-        .replace("#WATER_OUTFLOW_L_LAYER", &(TerrainLayers::WaterOutflowL as usize).to_string())
-        .replace("#WATER_OUTFLOW_R_LAYER", &(TerrainLayers::WaterOutflowR as usize).to_string())
-        .replace("#WATER_OUTFLOW_T_LAYER", &(TerrainLayers::WaterOutflowT as usize).to_string())
-        .replace("#WATER_OUTFLOW_B_LAYER", &(TerrainLayers::WaterOutflowB as usize).to_string())
-        .replace("#WATER_VELOCITY_X_LAYER", &(TerrainLayers::WaterVelocityX as usize).to_string())
-        .replace("#WATER_VELOCITY_Y_LAYER", &(TerrainLayers::WaterVelocityY as usize).to_string())
-        .replace("#HARDNESS_LAYER", &(TerrainLayers::Hardness as usize).to_string())
-        .replace("#HARDNESS_STRATA_AMOUNT_LAYER", &(TerrainLayers::HardnessStrataAmount as usize).to_string())
-        .replace("#HARDNESS_STRATA_WAVELENGTH_LAYER", &(TerrainLayers::HardnessStrataWavelength as usize).to_string())
-        .replace("#TERRAIN_BASE", &TERRAIN_BASE.to_string())
+        .replace("ROCK_LAYER", &(TerrainLayers::Rock as usize).to_string())
+        .replace("SOIL_LAYER", &(TerrainLayers::Soil as usize).to_string())
+        .replace(
+            "SEDIMENT_LAYER",
+            &(TerrainLayers::Sediment as usize).to_string(),
+        )
+        .replace("WATER_LAYER", &(TerrainLayers::Water as usize).to_string())
+        .replace(
+            "WATER_OUTFLOW_L_LAYER",
+            &(TerrainLayers::WaterOutflowL as usize).to_string(),
+        )
+        .replace(
+            "WATER_OUTFLOW_R_LAYER",
+            &(TerrainLayers::WaterOutflowR as usize).to_string(),
+        )
+        .replace(
+            "WATER_OUTFLOW_T_LAYER",
+            &(TerrainLayers::WaterOutflowT as usize).to_string(),
+        )
+        .replace(
+            "WATER_OUTFLOW_B_LAYER",
+            &(TerrainLayers::WaterOutflowB as usize).to_string(),
+        )
+        .replace(
+            "WATER_VELOCITY_X_LAYER",
+            &(TerrainLayers::WaterVelocityX as usize).to_string(),
+        )
+        .replace(
+            "WATER_VELOCITY_Y_LAYER",
+            &(TerrainLayers::WaterVelocityY as usize).to_string(),
+        )
+        .replace(
+            "HARDNESS_LAYER",
+            &(TerrainLayers::Hardness as usize).to_string(),
+        )
+        .replace(
+            "HARDNESS_STRATA_AMOUNT_LAYER",
+            &(TerrainLayers::HardnessStrataAmount as usize).to_string(),
+        )
+        .replace(
+            "HARDNESS_STRATA_WAVELENGTH_LAYER",
+            &(TerrainLayers::HardnessStrataWavelength as usize).to_string(),
+        )
+        .replace("TERRAIN_BASE", &TERRAIN_BASE.to_string())
 }
 
 #[derive(Debug, Clone)]
@@ -443,11 +597,9 @@ pub struct TerrainState {
     pub normalmap: Arc<Texture>,
 }
 impl TerrainState {
-    pub fn new_empty(assets: AssetCache, size: TerrainSize) -> Self {
-        let gpu = GpuKey.get(&assets);
-
+    pub fn new_empty(gpu: &Gpu, assets: &AssetCache, size: TerrainSize) -> Self {
         let heightmap = Arc::new(Texture::new(
-            gpu.clone(),
+            gpu,
             &wgpu::TextureDescriptor {
                 size: size.heightmap_extent(),
                 mip_level_count: 1,
@@ -459,6 +611,7 @@ impl TerrainState {
                     | wgpu::TextureUsages::COPY_SRC
                     | wgpu::TextureUsages::STORAGE_BINDING,
                 label: Some("heightmap"),
+                view_formats: &[],
             },
         ));
 
@@ -476,26 +629,41 @@ impl TerrainState {
                     | wgpu::TextureUsages::STORAGE_BINDING
                     | wgpu::TextureUsages::RENDER_ATTACHMENT,
                 label: Some("normalmap"),
+                view_formats: &[],
             },
         ));
-        FillerKey { format: normalmap.format }.get(&assets).run(
+        FillerKey {
+            format: normalmap.format,
+        }
+        .get(assets)
+        .run(
+            gpu,
             &normalmap.create_view(&wgpu::TextureViewDescriptor {
                 base_mip_level: 0,
-                mip_level_count: NonZeroU32::new(1),
+                mip_level_count: Some(1),
                 ..Default::default()
             }),
             normalmap.size,
             vec4(0., 0., 1., 0.),
         );
-        normalmap.generate_mipmaps(assets);
+        normalmap.generate_mipmaps(gpu, assets);
 
-        Self { id: friendly_id(), size, heightmap, normalmap }
+        Self {
+            id: friendly_id(),
+            size,
+            heightmap,
+            normalmap,
+        }
     }
-    pub async fn to_cpu(&self) -> Option<TerrainStateCpu> {
-        self.reader().read().await
+    pub async fn to_cpu(&self, gpu: &Gpu) -> Option<TerrainStateCpu> {
+        self.reader(gpu).read(gpu).await
     }
-    pub fn reader(&self) -> TerrainStateReader {
-        TerrainStateReader { size: self.size.clone(), heightmap: self.heightmap.reader(), normalmap: self.normalmap.reader() }
+    pub fn reader(&self, gpu: &Gpu) -> TerrainStateReader {
+        TerrainStateReader {
+            size: self.size.clone(),
+            heightmap: self.heightmap.reader(gpu),
+            normalmap: self.normalmap.reader(gpu),
+        }
     }
 }
 
@@ -505,11 +673,19 @@ pub struct TerrainStateReader {
     normalmap: TextureReader,
 }
 impl TerrainStateReader {
-    pub async fn read(&self) -> Option<TerrainStateCpu> {
+    pub async fn read(&self, gpu: &Gpu) -> Option<TerrainStateCpu> {
         Some(TerrainStateCpu {
             size: self.size.clone(),
-            heightmap: self.heightmap.read_array_f32().await?.remove_axis(Axis(3)),
-            normalmap: self.normalmap.read_array_f32().await?.remove_axis(Axis(0)),
+            heightmap: self
+                .heightmap
+                .read_array_f32(gpu)
+                .await?
+                .remove_axis(Axis(3)),
+            normalmap: self
+                .normalmap
+                .read_array_f32(gpu)
+                .await?
+                .remove_axis(Axis(0)),
         })
     }
 }
@@ -524,7 +700,11 @@ impl TerrainStateCpu {
     pub fn empty() -> Self {
         let size = TerrainSize::new();
         Self {
-            heightmap: Array3::zeros((TERRAIN_LAYERS as usize, size.texture_size(), size.texture_size())),
+            heightmap: Array3::zeros((
+                TERRAIN_LAYERS as usize,
+                size.texture_size(),
+                size.texture_size(),
+            )),
             normalmap: Array3::zeros((size.texture_size(), size.texture_size(), 4)),
             size,
         }
@@ -534,10 +714,10 @@ impl TerrainStateCpu {
         self.heightmap.shape()
     }
 
-    pub fn to_gpu(&self, assets: AssetCache) -> TerrainState {
-        let state = TerrainState::new_empty(assets, self.size.clone());
-        state.heightmap.write_array(&self.heightmap);
-        state.normalmap.write_array(&self.normalmap);
+    pub fn to_gpu(&self, gpu: &Gpu, assets: &AssetCache) -> TerrainState {
+        let state = TerrainState::new_empty(gpu, assets, self.size.clone());
+        state.heightmap.write_array(gpu, &self.heightmap);
+        state.normalmap.write_array(gpu, &self.normalmap);
         state
     }
     pub fn texel_from_world_offset(&self, offset: Vec2) -> IVec2 {
@@ -547,10 +727,17 @@ impl TerrainStateCpu {
     }
     pub fn get_slice_at_texel(&self, texel: IVec2) -> Option<ArrayView3<f32>> {
         let shape = self.heightmap.shape();
-        if texel.x < 0 || texel.y < 0 || texel.x > shape[1] as i32 - 1 || texel.y > shape[2] as i32 - 1 {
+        if texel.x < 0
+            || texel.y < 0
+            || texel.x > shape[1] as i32 - 1
+            || texel.y > shape[2] as i32 - 1
+        {
             return None;
         }
-        Some(self.heightmap.slice(s![..2, texel.y..(texel.y + 1), texel.x..(texel.x + 1)]))
+        Some(
+            self.heightmap
+                .slice(s![..2, texel.y..(texel.y + 1), texel.x..(texel.x + 1)]),
+        )
     }
     pub fn get_slice_at_world_offset(&self, offset: Vec2) -> Option<ArrayView3<f32>> {
         self.get_slice_at_texel(self.texel_from_world_offset(offset))
@@ -559,7 +746,8 @@ impl TerrainStateCpu {
         self.get_slice_at_texel(texel).map(|x| x.sum())
     }
     pub fn get_height_at_world_offset(&self, offset: Vec2) -> f32 {
-        self.get_height_at_texel(self.texel_from_world_offset(offset)).unwrap_or_default()
+        self.get_height_at_texel(self.texel_from_world_offset(offset))
+            .unwrap_or_default()
     }
 
     pub fn contains(&self, pos: Vec2, point: Vec2) -> bool {
@@ -648,13 +836,13 @@ pub fn use_async_asset<T: Asset + Clone + Sync + Send + std::fmt::Debug + 'stati
     hooks: &mut Hooks,
     asset_key: impl AsyncAssetKeyExt<T> + 'static,
 ) -> Option<T> {
-    let (value, set_value) = hooks.use_state(None);
-    hooks.use_effect(asset_key.key(), |world, _| {
+    let (value, set_value) = use_state(hooks, None);
+    use_effect(hooks, asset_key.key(), |world, _| {
         let assets = world.resource(asset_cache()).clone();
         world.resource(runtime()).spawn(async move {
             set_value(Some(asset_key.get(&assets).await));
         });
-        Box::new(|_| {})
+        |_| {}
     });
     value
 }
@@ -667,18 +855,28 @@ pub struct Terrain {
 impl ElementComponent for Terrain {
     fn render(self: Box<Self>, hooks: &mut Hooks) -> Element {
         let assets = hooks.world.resource(asset_cache()).clone();
+        let gpu = GpuKey.get(&assets);
 
-        let (material_def, set_material_def) =
-            hooks.use_state_with(|world| world.persisted_resource(terrain_material_def()).cloned().unwrap_or_default());
+        let (material_def, set_material_def) = use_state_with(hooks, |world| {
+            world
+                .persisted_resource(terrain_material_def())
+                .cloned()
+                .unwrap_or_default()
+        });
 
-        let ground_textures = use_async_asset(hooks, TerrainTexturesKey { texs: material_def.build().textures })
-            .and_then(|x| x.ok())
-            .unwrap_or_else(|| PixelTextureKey::white().get(&assets));
+        let ground_textures = use_async_asset(
+            hooks,
+            TerrainTexturesKey {
+                texs: material_def.build().textures,
+            },
+        )
+        .and_then(|x| x.ok())
+        .unwrap_or_else(|| PixelTextureKey::white().get(&assets));
 
         let noise_texture = use_async_asset(
             hooks,
             TextureFromUrl {
-                url: AbsAssetUrl::parse(format!(
+                url: AbsAssetUrl::from_str(&format!(
                     "{OLD_CONTENT_SERVER_URL}assets/models/{}",
                     "ArtStationSurfaces/VFX-HQ-Seamless-Noise-Pack-Vol1/Noise_002.png"
                 ))
@@ -690,8 +888,8 @@ impl ElementComponent for Terrain {
         .unwrap_or_else(|| PixelTextureKey::white().get(&assets));
 
         // let (ground_textures, set_ground_textures) =
-        //     hooks.use_state_with(|_| Arc::new(Texture::new_single_color_texture_array(gpu.clone(), vec![UVec4::ONE, UVec4::ONE])));
-        // hooks.use_effect(
+        //     use_state_with(hooks, |_| Arc::new(Texture::new_single_color_texture_array(gpu.clone(), vec![UVec4::ONE, UVec4::ONE])));
+        // use_effect(hooks,
         //     world,
         //     material_def.clone(),
         //     closure!(clone material_def, |world| {
@@ -704,30 +902,53 @@ impl ElementComponent for Terrain {
         //                 Err(err) => log::error!("Failed to load terrain textures: {:?}", err)
         //             }
         //         });
-        //         Box::new(|_| {})
+        //         |_| {}
         //     }),
         // );
-        hooks.use_frame(closure!(clone material_def, |world| {
-            if let Some(def) = world.persisted_resource(terrain_material_def()) {
-                if def != &material_def {
-                    set_material_def(def.clone());
+        use_frame(
+            hooks,
+            closure!(clone material_def, |world| {
+                if let Some(def) = world.persisted_resource(terrain_material_def()) {
+                    if def != &material_def {
+                        set_material_def(def.clone());
+                    }
                 }
-            }
-        }));
+            }),
+        );
 
         let size_in_meters = self.state.size.size_in_meters();
 
         let lod_factor = 1. / 12.;
         let cell_diagonal = (size_in_meters * size_in_meters * 2.).sqrt();
         let heightmap_position = self.heightmap_position.extend(0.);
-        let terrain_material = hooks.use_memo_with(
-            (self.state.id.clone(), ground_textures.id, material_def, noise_texture.id),
+        let terrain_material = use_memo_with(
+            hooks,
+            (
+                self.state.id.clone(),
+                ground_textures.id,
+                material_def,
+                noise_texture.id,
+            ),
             |_, (_, _, material_def, _)| {
                 SharedMaterial::new(TerrainMaterial::new(
-                    assets.clone(),
-                    TerrainMaterialParams { heightmap_position, lod_factor, cell_diagonal, _padding: Default::default() },
-                    Arc::new(self.state.heightmap.create_view(&wgpu::TextureViewDescriptor::default())),
-                    Arc::new(self.state.normalmap.create_view(&wgpu::TextureViewDescriptor::default())),
+                    &gpu,
+                    &assets,
+                    TerrainMaterialParams {
+                        heightmap_position,
+                        lod_factor,
+                        cell_diagonal,
+                        _padding: Default::default(),
+                    },
+                    Arc::new(
+                        self.state
+                            .heightmap
+                            .create_view(&wgpu::TextureViewDescriptor::default()),
+                    ),
+                    Arc::new(
+                        self.state
+                            .normalmap
+                            .create_view(&wgpu::TextureViewDescriptor::default()),
+                    ),
                     Arc::new(ground_textures.create_view(&wgpu::TextureViewDescriptor {
                         dimension: Some(wgpu::TextureViewDimension::D2Array),
                         ..Default::default()
@@ -747,7 +968,10 @@ impl ElementComponent for Terrain {
                 GridMeshKey(GridMesh {
                     n_vertices_height: self.state.size.polygons_at_lod(lod) + 1,
                     n_vertices_width: self.state.size.polygons_at_lod(lod) + 1,
-                    size: glam::vec2(self.state.size.size_in_meters(), self.state.size.size_in_meters()),
+                    size: glam::vec2(
+                        self.state.size.size_in_meters(),
+                        self.state.size.size_in_meters(),
+                    ),
                     ..GridMesh::default()
                 })
                 .get(&assets)
@@ -755,41 +979,59 @@ impl ElementComponent for Terrain {
             .collect_vec();
 
         let (height_min, height_max) = (0., 500.);
-        let aabb = AABB { min: vec3(0., 0., height_min), max: vec3(size_in_meters, size_in_meters, height_max) };
+        let aabb = AABB {
+            min: vec3(0., 0., height_min),
+            max: vec3(size_in_meters, size_in_meters, height_max),
+        };
         let bound_sphere = aabb.to_sphere();
         Element::new()
-            .set(terrain(), ())
+            .with(terrain(), ())
             .init_default(terrain_cell())
-            .set(renderer_shader(), cb(|assets, config| TerrainShaderKey { shadow_cascades: config.shadow_cascades }.get(assets)))
-            .set(material(), terrain_material)
-            .set(primitives(), vec![])
-            .set_default(gpu_primitives())
-            .set(main_scene(), ())
-            .set(mesh(), lod_meshes[0].clone())
-            .set(terrain_lods(), lod_meshes.clone())
-            .set(terrain_lod_factor(), lod_factor)
-            .set(terrain_cell_diagonal(), cell_diagonal)
-            .set(cpu_lod(), 0_usize)
-            .set(terrain_cell_bounding(), bound_sphere)
-            .set(local_bounding_aabb(), aabb)
-            .set(world_bounding_aabb(), aabb)
-            .set(world_bounding_sphere(), bound_sphere)
-            .set(color(), Vec4::ONE)
-            .set_default(cast_shadows())
-            .set_default(local_to_parent())
-            .set_default(local_to_world())
+            .with(
+                renderer_shader(),
+                cb(|assets, config| {
+                    TerrainShaderKey {
+                        shadow_cascades: config.shadow_cascades,
+                    }
+                    .get(assets)
+                }),
+            )
+            .with(material(), terrain_material)
+            .with(primitives(), vec![])
+            .with(gpu_primitives_mesh(), Default::default())
+            .with(gpu_primitives_lod(), Default::default())
+            .with(main_scene(), ())
+            .with(mesh(), lod_meshes[0].clone())
+            .with(terrain_lods(), lod_meshes.clone())
+            .with(terrain_lod_factor(), lod_factor)
+            .with(terrain_cell_diagonal(), cell_diagonal)
+            .with(cpu_lod(), 0_usize)
+            .with(terrain_cell_bounding(), bound_sphere)
+            .with(local_bounding_aabb(), aabb)
+            .with(world_bounding_aabb(), aabb)
+            .with(world_bounding_sphere(), bound_sphere)
+            .with(color(), Vec4::ONE)
+            .with(cast_shadows(), ())
+            .with(local_to_parent(), Default::default())
+            .with(local_to_world(), Default::default())
             .init_default(mesh_to_world())
     }
 }
 
-pub fn px_rigid_static_from_heightmap(physics: &Physics, physics_material: PxMaterial, heightmap: &Array3<f32>) -> PxRigidStaticRef {
+pub fn px_rigid_static_from_heightmap(
+    physics: &Physics,
+    physics_material: PxMaterial,
+    heightmap: &Array3<f32>,
+) -> PxRigidStaticRef {
     let heightmap = heightmap.slice(s![0..2, .., ..]).sum_axis(Axis(0));
     let texture_size = heightmap.shape()[0];
     let total_size = texture_size - 1;
 
     let mut heightmap_samples = heightmap.reversed_axes();
     heightmap_samples.invert_axis(Axis(1));
-    let mut quantized = PxQuantizedHeightFieldSamples::new_from_f32_array(heightmap_samples.as_standard_layout().as_slice().unwrap());
+    let mut quantized = PxQuantizedHeightFieldSamples::new_from_f32_array(
+        heightmap_samples.as_standard_layout().as_slice().unwrap(),
+    );
     for i in 0..quantized.samples.len() {
         quantized.samples[i].set_tesselation(true);
     }
@@ -806,6 +1048,9 @@ pub fn px_rigid_static_from_heightmap(physics: &Physics, physics_material: PxMat
             xy_scale,
         ),
         &physics_material,
-        &PxTransform::new(vec3(0., xy_scale * (total_size as f32), quantized.min_height), Quat::from_rotation_x(PI / 2.)),
+        &PxTransform::new(
+            vec3(0., xy_scale * (total_size as f32), quantized.min_height),
+            Quat::from_rotation_x(PI / 2.),
+        ),
     )
 }

@@ -8,20 +8,21 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-ambient_sys = { path = "../sys"}
+ambient_sys = { path = "../sys" }
 ambient_app = { path = "../app" }
-ambient_std = { path = "../std" }
+ambient_native_std = { path = "../native_std" }
 ambient_ecs = { path = "../ecs" }
 ambient_gpu = { path = "../gpu" }
+ambient_gpu_ecs = { path = "../gpu_ecs" }
 ambient_core = { path = "../core" }
 ambient_meshes = { path = "../meshes" }
-ambient_element = { path = "../element" }
+ambient_element = { path = "../../shared_crates/element" }
 ambient_renderer = { path = "../renderer" }
-ambient_ui = { path = "../ui" }
+ambient_ui_native = { path = "../ui_native" }
 ambient_network = { path = "../network" }
 ambient_intent = { path = "../intent" }
 ambient_physics = { path = "../physics" }
-ambient_editor_derive = { path = "../editor_derive" }
+ambient_editor_derive = { path = "../../shared_crates/editor_derive" }
 physxx = { path = "../../libs/physxx" }
 wgpu = { workspace = true }
 serde = { workspace = true }
@@ -34,17 +35,10 @@ bytemuck = { workspace = true }
 serde_json = { workspace = true }
 closure = { workspace = true }
 profiling = { workspace = true }
-bitflags = { workspace = true }
 rand = { workspace = true }
 rand_pcg = { workspace = true }
-tokio = { workspace = true }
 anyhow = { workspace = true }
-parking_lot = { workspace = true }
-flume = { workspace = true }
 tracing = { workspace = true }
 
 [features]
-hotload-includes = ['ambient_std/hotload-includes']
-
-[target.'cfg(not(target_os = "unknown"))'.dependencies]
-quinn = { workspace = true }
+hotload-includes = ['ambient_native_std/hotload-includes']

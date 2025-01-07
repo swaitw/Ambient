@@ -1,113 +1,28 @@
-use std::collections::HashSet;
+use std::{collections::HashSet, sync::Arc};
 
 use ambient_ecs::{
-    components, ensure_has_component, query, query_mut, Concept, Debuggable, Description, ECSError, Entity, EntityId, FrameEvent,
-    MakeDefault, MaybeResource, Name, Networked, QueryState, RefConcept, Store, System, SystemGroup, World,
+    components, ensure_has_component, query, query_mut, Debuggable, ECSError, EntityId, FrameEvent,
+    Networked, QueryState, Store, System, SystemGroup, World,
 };
 use glam::*;
 
 use crate::{
     camera::get_active_camera,
-    gpu_components,
-    gpu_ecs::{ComponentToGpuSystem, GpuComponentFormat, GpuWorldSyncEvent},
     hierarchy::{children, parent},
     main_scene,
     player::local_user_id,
 };
+use ambient_gpu_ecs::{ComponentToGpuSystem, GpuComponentFormat, GpuWorldSyncEvent};
 
-fn vec3_one() -> Vec3 {
-    Vec3::ONE
-}
+pub use ambient_ecs::generated::transform::components::{
+    cylindrical_billboard_z, euler_rotation, inv_local_to_world, local_to_parent, local_to_world,
+    lookat_target, lookat_up, mesh_to_local, mesh_to_world, reset_scale, rotation, scale,
+    spherical_billboard, translation,
+};
+use ambient_gpu::gpu::Gpu;
+use ambient_gpu_ecs::gpu_components;
 
 components!("transform", {
-    @[
-        MakeDefault, Debuggable, Networked, Store,
-        Name["Translation"],
-        Description["The translation/position of this entity."]
-    ]
-    translation: Vec3,
-    @[
-        MakeDefault[vec3_one], Debuggable, Networked, Store,
-        Name["Scale"],
-        Description["The scale of this entity."]
-    ]
-    scale: Vec3,
-    @[
-        Debuggable, Networked, Store,
-        Name["Rotation"],
-        Description["The rotation of this entity."]
-    ]
-    rotation: Quat,
-    @[
-        MakeDefault, Debuggable, Networked, Store,
-        Name["Euler rotation"],
-        Description["The Euler rotation of this entity in ZYX order."]
-    ]
-    euler_rotation: Vec3,
-    @[
-        Debuggable, Networked, Store,
-        Name["Look-at center"],
-        Description["The position that this entity should be looking at."]
-    ]
-    lookat_center: Vec3,
-    @[
-        Debuggable, Networked, Store,
-        Name["Look-at up"],
-        Description["When combined with `lookat_center`, the up vector for this entity."]
-    ]
-    lookat_up: Vec3,
-
-    @[
-        Debuggable, Networked, Store,
-        Name["Local to World"],
-        Description["Transformation from the entity's local space to worldspace."]
-    ]
-    local_to_world: Mat4,
-    @[
-        Debuggable, Networked, Store,
-        Name["Inverse Local to World"],
-        Description["Converts a world position to a local position.\nThis is automatically updated."]
-    ]
-    inv_local_to_world: Mat4,
-
-    @[
-        Debuggable, Networked, Store, MaybeResource,
-        Name["Local to Parent"],
-        Description["Transformation from the entity's local space to the parent's space."]
-    ]
-    local_to_parent: Mat4,
-    @[
-        Debuggable, Networked, Store,
-        Name["Mesh to Local"],
-        Description["Transformation from mesh-space to the entity's local space."]
-    ]
-    mesh_to_local: Mat4,
-    @[
-        Debuggable, Networked, Store,
-        Name["Mesh to World"],
-        Description["Transformation from mesh-space to world space.\nThis is automatically updated when `mesh_to_local` and `local_to_world` change."]
-    ]
-    mesh_to_world: Mat4,
-    @[
-        Debuggable, Networked, Store,
-        Name["Spherical billboard"],
-        Description["If attached, this ensures that this entity is always aligned with the camera."]
-    ]
-    spherical_billboard: (),
-    @[
-        Debuggable, Networked, Store,
-        Name["Cylindrical billboard Z"],
-        Description["If attached, this ensures this entity is always aligned with the camera, except on the Z-axis.\nThis is useful for decorations that the player will be looking at from roughly the same altitude."]
-    ]
-    cylindrical_billboard_z: (),
-
-    @[
-        Debuggable, Networked, Store,
-        Name["Reset scale"],
-        Description["If attached to a transform hierarchy, the scale will be reset at that point, with only rotation/translation considered."]
-    ]
-    reset_scale: (),
-
     // FBX
     @[Debuggable, Networked, Store]
     fbx_complex_transform: (),
@@ -129,17 +44,6 @@ gpu_components! {
     mesh_to_world() => mesh_to_world: GpuComponentFormat::Mat4,
 }
 
-pub fn concepts() -> Vec<Concept> {
-    vec![RefConcept {
-        id: "transformable",
-        name: "Transformable",
-        description: "Can be translated, rotated and scaled.",
-        extends: &[],
-        data: Entity::new().with(translation(), Vec3::ZERO).with(rotation(), Quat::IDENTITY).with(scale(), Vec3::ONE),
-    }
-    .to_owned()]
-}
-
 #[derive(Debug)]
 pub struct TransformSystem {
     systems: SystemGroup,
@@ -153,48 +57,81 @@ impl TransformSystem {
             systems: SystemGroup::new(
                 "transform_systems",
                 vec![
-                    query_mut((rotation(),), (euler_rotation().changed(),)).to_system(|query, world, state, _| {
-                        for (_, (rot,), (&r,)) in query.iter(world, state) {
-                            *rot = Quat::from_euler(EulerRot::ZYX, r.z, r.y, r.x);
+                    query_mut((rotation(),), (euler_rotation().changed(),)).to_system(
+                        |query, world, state, _| {
+                            for (_, (rot,), (&r,)) in query.iter(world, state) {
+                                *rot = Quat::from_euler(EulerRot::ZYX, r.z, r.y, r.x);
+                            }
+                        },
+                    ),
+                    query_mut(
+                        (local_to_parent(),),
+                        (
+                            translation().changed(),
+                            rotation().changed(),
+                            scale().changed(),
+                        ),
+                    )
+                    .excl(fbx_complex_transform())
+                    .to_system(|query, world, state, _| {
+                        for (_, (local_to_parent,), (&translation, &rotation, &scale)) in
+                            query.iter(world, state)
+                        {
+                            *local_to_parent =
+                                Mat4::from_scale_rotation_translation(scale, rotation, translation);
                         }
                     }),
-                    query_mut((local_to_parent(),), (translation().changed(), rotation().changed(), scale().changed()))
-                        .excl(fbx_complex_transform())
-                        .to_system(|query, world, state, _| {
-                            for (_, (local_to_parent,), (&translation, &rotation, &scale)) in query.iter(world, state) {
-                                *local_to_parent = Mat4::from_scale_rotation_translation(scale, rotation, translation);
-                            }
-                        }),
-                    query_mut((local_to_parent(),), (translation().changed(), scale().changed()))
-                        .excl(rotation())
-                        .excl(fbx_complex_transform())
-                        .to_system(|query, world, state, _| {
-                            for (_, (local_to_parent,), (&translation, &scale)) in query.iter(world, state) {
-                                *local_to_parent = Mat4::from_scale_rotation_translation(scale, Quat::IDENTITY, translation);
-                            }
-                        }),
-                    query_mut((local_to_parent(),), (translation().changed(), rotation().changed()))
-                        .excl(scale())
-                        .excl(fbx_complex_transform())
-                        .to_system(|query, world, state, _| {
-                            for (_, (local_to_parent,), (&translation, &rotation)) in query.iter(world, state) {
-                                *local_to_parent = Mat4::from_rotation_translation(rotation, translation);
-                            }
-                        }),
-                    query_mut((local_to_parent(),), (scale().changed(), rotation().changed()))
-                        .excl(translation())
-                        .excl(fbx_complex_transform())
-                        .to_system(|query, world, state, _| {
-                            for (_, (local_to_parent,), (&scale, &rotation)) in query.iter(world, state) {
-                                *local_to_parent = Mat4::from_scale_rotation_translation(scale, rotation, Vec3::ZERO);
-                            }
-                        }),
+                    query_mut(
+                        (local_to_parent(),),
+                        (translation().changed(), scale().changed()),
+                    )
+                    .excl(rotation())
+                    .excl(fbx_complex_transform())
+                    .to_system(|query, world, state, _| {
+                        for (_, (local_to_parent,), (&translation, &scale)) in
+                            query.iter(world, state)
+                        {
+                            *local_to_parent = Mat4::from_scale_rotation_translation(
+                                scale,
+                                Quat::IDENTITY,
+                                translation,
+                            );
+                        }
+                    }),
+                    query_mut(
+                        (local_to_parent(),),
+                        (translation().changed(), rotation().changed()),
+                    )
+                    .excl(scale())
+                    .excl(fbx_complex_transform())
+                    .to_system(|query, world, state, _| {
+                        for (_, (local_to_parent,), (&translation, &rotation)) in
+                            query.iter(world, state)
+                        {
+                            *local_to_parent =
+                                Mat4::from_rotation_translation(rotation, translation);
+                        }
+                    }),
+                    query_mut(
+                        (local_to_parent(),),
+                        (scale().changed(), rotation().changed()),
+                    )
+                    .excl(translation())
+                    .excl(fbx_complex_transform())
+                    .to_system(|query, world, state, _| {
+                        for (_, (local_to_parent,), (&scale, &rotation)) in query.iter(world, state)
+                        {
+                            *local_to_parent =
+                                Mat4::from_scale_rotation_translation(scale, rotation, Vec3::ZERO);
+                        }
+                    }),
                     query_mut((local_to_parent(),), (translation().changed(),))
                         .excl(scale())
                         .excl(rotation())
                         .excl(fbx_complex_transform())
                         .to_system(|query, world, state, _| {
-                            for (_, (local_to_parent,), (&translation,)) in query.iter(world, state) {
+                            for (_, (local_to_parent,), (&translation,)) in query.iter(world, state)
+                            {
                                 *local_to_parent = Mat4::from_translation(translation);
                             }
                         }),
@@ -216,48 +153,73 @@ impl TransformSystem {
                                 *local_to_parent = Mat4::from_scale(scale);
                             }
                         }),
-                    query_mut((local_to_world(),), (translation().changed(), rotation().changed(), scale().changed()))
-                        .excl(local_to_parent())
-                        .excl(lookat_center())
-                        .excl(fbx_complex_transform())
-                        .to_system(|query, world, state, _| {
-                            for (_, (local_to_world,), (&translation, &rotation, &scale)) in query.iter(world, state) {
-                                *local_to_world = Mat4::from_scale_rotation_translation(scale, rotation, translation);
-                            }
-                        }),
-                    query_mut((local_to_world(),), (translation().changed(), rotation().changed()))
-                        .excl(local_to_parent())
-                        .excl(lookat_center())
-                        .excl(scale())
-                        .excl(fbx_complex_transform())
-                        .to_system(|q, world, qs, _| {
-                            for (_, (local_to_world,), (&translation, &rotation)) in q.iter(world, qs) {
-                                *local_to_world = Mat4::from_rotation_translation(rotation, translation);
-                            }
-                        }),
-                    query_mut((local_to_world(),), (translation().changed(), scale().changed()))
-                        .excl(local_to_parent())
-                        .excl(lookat_center())
-                        .excl(rotation())
-                        .excl(fbx_complex_transform())
-                        .to_system(|q, world, qs, _| {
-                            for (_, (local_to_world,), (&translation, &scale)) in q.iter(world, qs) {
-                                *local_to_world = Mat4::from_scale_rotation_translation(scale, Quat::IDENTITY, translation);
-                            }
-                        }),
-                    query_mut((local_to_world(),), (rotation().changed(), scale().changed()))
-                        .excl(local_to_parent())
-                        .excl(lookat_center())
-                        .excl(translation())
-                        .excl(fbx_complex_transform())
-                        .to_system(|q, world, qs, _| {
-                            for (_, (local_to_world,), (&rotation, &scale)) in q.iter(world, qs) {
-                                *local_to_world = Mat4::from_scale_rotation_translation(scale, rotation, Vec3::ZERO);
-                            }
-                        }),
+                    query_mut(
+                        (local_to_world(),),
+                        (
+                            translation().changed(),
+                            rotation().changed(),
+                            scale().changed(),
+                        ),
+                    )
+                    .excl(local_to_parent())
+                    .excl(lookat_target())
+                    .excl(fbx_complex_transform())
+                    .to_system(|query, world, state, _| {
+                        for (_, (local_to_world,), (&translation, &rotation, &scale)) in
+                            query.iter(world, state)
+                        {
+                            *local_to_world =
+                                Mat4::from_scale_rotation_translation(scale, rotation, translation);
+                        }
+                    }),
+                    query_mut(
+                        (local_to_world(),),
+                        (translation().changed(), rotation().changed()),
+                    )
+                    .excl(local_to_parent())
+                    .excl(lookat_target())
+                    .excl(scale())
+                    .excl(fbx_complex_transform())
+                    .to_system(|q, world, qs, _| {
+                        for (_, (local_to_world,), (&translation, &rotation)) in q.iter(world, qs) {
+                            *local_to_world =
+                                Mat4::from_rotation_translation(rotation, translation);
+                        }
+                    }),
+                    query_mut(
+                        (local_to_world(),),
+                        (translation().changed(), scale().changed()),
+                    )
+                    .excl(local_to_parent())
+                    .excl(lookat_target())
+                    .excl(rotation())
+                    .excl(fbx_complex_transform())
+                    .to_system(|q, world, qs, _| {
+                        for (_, (local_to_world,), (&translation, &scale)) in q.iter(world, qs) {
+                            *local_to_world = Mat4::from_scale_rotation_translation(
+                                scale,
+                                Quat::IDENTITY,
+                                translation,
+                            );
+                        }
+                    }),
+                    query_mut(
+                        (local_to_world(),),
+                        (rotation().changed(), scale().changed()),
+                    )
+                    .excl(local_to_parent())
+                    .excl(lookat_target())
+                    .excl(translation())
+                    .excl(fbx_complex_transform())
+                    .to_system(|q, world, qs, _| {
+                        for (_, (local_to_world,), (&rotation, &scale)) in q.iter(world, qs) {
+                            *local_to_world =
+                                Mat4::from_scale_rotation_translation(scale, rotation, Vec3::ZERO);
+                        }
+                    }),
                     query_mut((local_to_world(),), (translation().changed(),))
                         .excl(local_to_parent())
-                        .excl(lookat_center())
+                        .excl(lookat_target())
                         .excl(scale())
                         .excl(rotation())
                         .excl(fbx_complex_transform())
@@ -268,7 +230,7 @@ impl TransformSystem {
                         }),
                     query_mut((local_to_world(),), (scale().changed(),))
                         .excl(local_to_parent())
-                        .excl(lookat_center())
+                        .excl(lookat_target())
                         .excl(translation())
                         .excl(rotation())
                         .excl(fbx_complex_transform())
@@ -279,7 +241,7 @@ impl TransformSystem {
                         }),
                     query_mut((local_to_world(),), (rotation().changed(),))
                         .excl(local_to_parent())
-                        .excl(lookat_center())
+                        .excl(lookat_target())
                         .excl(translation())
                         .excl(scale())
                         .excl(fbx_complex_transform())
@@ -289,81 +251,170 @@ impl TransformSystem {
                             }
                         }),
                     // Make sure lookat has all the components
-                    ensure_has_component(lookat_center(), local_to_world(), Default::default()),
-                    ensure_has_component(lookat_center(), inv_local_to_world(), Default::default()),
-                    ensure_has_component(lookat_center(), translation(), Default::default()),
-                    ensure_has_component(lookat_center(), lookat_up(), Vec3::Z),
+                    ensure_has_component(lookat_target(), local_to_world(), Default::default()),
+                    ensure_has_component(lookat_target(), inv_local_to_world(), Default::default()),
+                    ensure_has_component(lookat_target(), translation(), Default::default()),
+                    ensure_has_component(lookat_target(), lookat_up(), Vec3::Z),
                     query_mut(
                         (local_to_world(), inv_local_to_world()),
-                        (translation().changed(), lookat_center().changed(), lookat_up().changed()),
+                        (
+                            translation().changed(),
+                            lookat_target().changed(),
+                            lookat_up().changed(),
+                        ),
                     )
                     .excl(local_to_parent())
                     .excl(fbx_complex_transform())
                     .to_system(|q, world, qs, _| {
-                        for (_, (local_to_world, inv_local_to_world), (&translation, &lookat_center, &lookat_up)) in q.iter(world, qs) {
-                            *inv_local_to_world = Mat4::look_at_lh(translation, lookat_center, lookat_up);
+                        for (
+                            _,
+                            (local_to_world, inv_local_to_world),
+                            (&translation, &lookat_target, &lookat_up),
+                        ) in q.iter(world, qs)
+                        {
+                            *inv_local_to_world =
+                                Mat4::look_at_lh(translation, lookat_target, lookat_up);
                             *local_to_world = inv_local_to_world.inverse();
                         }
                     }),
                     // FBX
-                    query((fbx_complex_transform(), local_to_parent()))
-                        .optional_changed(translation())
-                        .optional_changed(fbx_rotation_offset())
-                        .optional_changed(fbx_rotation_pivot())
-                        .optional_changed(fbx_pre_rotation())
-                        .optional_changed(rotation())
-                        .optional_changed(fbx_post_rotation())
-                        .optional_changed(fbx_rotation_pivot())
-                        .optional_changed(fbx_scaling_offset())
-                        .optional_changed(fbx_scaling_pivot())
-                        .optional_changed(scale())
-                        .optional_changed(fbx_scaling_pivot())
-                        .to_system(|q, world, qs, _| {
-                            // See: https://help.autodesk.com/view/FBX/2017/ENU/?guid=__files_GUID_10CDD63C_79C1_4F2D_BB28_AD2BE65A02ED_htm
-                            // and: https://github.com/assimp/assimp/blob/add7f1355e96c6ff0df0ba3cec084f25332d154e/code/AssetLib/FBX/FBXConverter.cpp#L687
-                            for (id, _) in q.collect_cloned(world, qs) {
-                                world.set(id, local_to_parent(), get_fbx_transform(world, id)).unwrap();
-                            }
-                        }),
-                    query((fbx_complex_transform(), local_to_world()))
-                        .optional_changed(translation())
-                        .optional_changed(fbx_rotation_offset())
-                        .optional_changed(fbx_rotation_pivot())
-                        .optional_changed(fbx_pre_rotation())
-                        .optional_changed(rotation())
-                        .optional_changed(fbx_post_rotation())
-                        .optional_changed(fbx_rotation_pivot())
-                        .optional_changed(fbx_scaling_offset())
-                        .optional_changed(fbx_scaling_pivot())
-                        .optional_changed(scale())
-                        .optional_changed(fbx_scaling_pivot())
-                        .to_system(|q, world, qs, _| {
-                            // See: https://help.autodesk.com/view/FBX/2017/ENU/?guid=__files_GUID_10CDD63C_79C1_4F2D_BB28_AD2BE65A02ED_htm
-                            // and: https://github.com/assimp/assimp/blob/add7f1355e96c6ff0df0ba3cec084f25332d154e/code/AssetLib/FBX/FBXConverter.cpp#L687
-                            for (id, _) in q.collect_cloned(world, qs) {
-                                world.set(id, local_to_world(), get_fbx_transform(world, id)).unwrap();
-                            }
-                        }),
+                    query_mut(
+                        local_to_parent(),
+                        (
+                            translation(),
+                            fbx_rotation_offset(),
+                            fbx_rotation_pivot(),
+                            fbx_pre_rotation(),
+                            rotation(),
+                            fbx_post_rotation(),
+                            fbx_scaling_offset(),
+                            fbx_scaling_pivot(),
+                            scale(),
+                        ),
+                    )
+                    .optional_changed(translation())
+                    .optional_changed(fbx_rotation_offset())
+                    .optional_changed(fbx_rotation_pivot())
+                    .optional_changed(fbx_pre_rotation())
+                    .optional_changed(rotation())
+                    .optional_changed(fbx_post_rotation())
+                    .optional_changed(fbx_scaling_offset())
+                    .optional_changed(fbx_scaling_pivot())
+                    .optional_changed(scale())
+                    .incl(fbx_complex_transform())
+                    .to_system(|q, world, qs, _| {
+                        // See: https://help.autodesk.com/view/FBX/2017/ENU/?guid=__files_GUID_10CDD63C_79C1_4F2D_BB28_AD2BE65A02ED_htm
+                        // and: https://github.com/assimp/assimp/blob/add7f1355e96c6ff0df0ba3cec084f25332d154e/code/AssetLib/FBX/FBXConverter.cpp#L687
+                        for (
+                            _,
+                            transform,
+                            (
+                                &pos,
+                                &rot_offset,
+                                &rot_pivot,
+                                &pre_rot,
+                                &rot,
+                                &post_rot,
+                                &scaling_offset,
+                                &scaling_pivot,
+                                &scaling,
+                            ),
+                        ) in q.iter(world, qs)
+                        {
+                            let o = pos + rot_offset + rot_pivot;
+                            let r = pre_rot * rot * post_rot.inverse();
+                            let p = scaling_offset + scaling_pivot
+                                - rot_pivot
+                                - scaling * scaling_pivot;
+                            let t = o + r * p;
+
+                            *transform = Mat4::from_scale_rotation_translation(scaling, r, t);
+                        }
+                    }),
+                    query_mut(
+                        local_to_world(),
+                        (
+                            translation(),
+                            fbx_rotation_offset(),
+                            fbx_rotation_pivot(),
+                            fbx_pre_rotation(),
+                            rotation(),
+                            fbx_post_rotation(),
+                            fbx_scaling_offset(),
+                            fbx_scaling_pivot(),
+                            scale(),
+                        ),
+                    )
+                    .optional_changed(translation())
+                    .optional_changed(fbx_rotation_offset())
+                    .optional_changed(fbx_rotation_pivot())
+                    .optional_changed(fbx_pre_rotation())
+                    .optional_changed(rotation())
+                    .optional_changed(fbx_post_rotation())
+                    .optional_changed(fbx_scaling_offset())
+                    .optional_changed(fbx_scaling_pivot())
+                    .optional_changed(scale())
+                    .incl(fbx_complex_transform())
+                    .excl(local_to_parent())
+                    .to_system(|q, world, qs, _| {
+                        // See: https://help.autodesk.com/view/FBX/2017/ENU/?guid=__files_GUID_10CDD63C_79C1_4F2D_BB28_AD2BE65A02ED_htm
+                        // and: https://github.com/assimp/assimp/blob/add7f1355e96c6ff0df0ba3cec084f25332d154e/code/AssetLib/FBX/FBXConverter.cpp#L687
+                        for (
+                            _,
+                            transform,
+                            (
+                                &pos,
+                                &rot_offset,
+                                &rot_pivot,
+                                &pre_rot,
+                                &rot,
+                                &post_rot,
+                                &scaling_offset,
+                                &scaling_pivot,
+                                &scaling,
+                            ),
+                        ) in q.iter(world, qs)
+                        {
+                            let o = pos + rot_offset + rot_pivot;
+                            let r = pre_rot * rot * post_rot.inverse();
+                            let p = scaling_offset + scaling_pivot
+                                - rot_pivot
+                                - scaling * scaling_pivot;
+                            let t = o + r * p;
+
+                            *transform = Mat4::from_scale_rotation_translation(scaling, r, t);
+                        }
+                    }),
                 ],
             ),
             post_parented_systems: SystemGroup::new(
                 "transform_systems",
                 vec![
-                    query_mut((mesh_to_world(),), (local_to_world().changed(), mesh_to_local().changed())).to_system(|q, world, qs, _| {
-                        for (_, (mesh_to_world,), (&local_to_world, &mesh_to_local)) in q.iter(world, qs) {
+                    query_mut(
+                        (mesh_to_world(),),
+                        (local_to_world().changed(), mesh_to_local().changed()),
+                    )
+                    .to_system(|q, world, qs, _| {
+                        for (_, (mesh_to_world,), (&local_to_world, &mesh_to_local)) in
+                            q.iter(world, qs)
+                        {
                             *mesh_to_world = local_to_world * mesh_to_local;
                         }
                     }),
-                    query_mut((mesh_to_world(),), (local_to_world().changed(),)).excl(mesh_to_local()).to_system(|q, world, qs, _| {
-                        for (_, (mesh_to_world,), (&local_to_world,)) in q.iter(world, qs) {
-                            *mesh_to_world = local_to_world;
-                        }
-                    }),
-                    query_mut((inv_local_to_world(),), (local_to_world().changed(),)).excl(lookat_center()).to_system(|q, world, qs, _| {
-                        for (_, (inv_local_to_world,), (local_to_world,)) in q.iter(world, qs) {
-                            *inv_local_to_world = local_to_world.inverse();
-                        }
-                    }),
+                    query_mut((mesh_to_world(),), (local_to_world().changed(),))
+                        .excl(mesh_to_local())
+                        .to_system(|q, world, qs, _| {
+                            for (_, (mesh_to_world,), (&local_to_world,)) in q.iter(world, qs) {
+                                *mesh_to_world = local_to_world;
+                            }
+                        }),
+                    query_mut((inv_local_to_world(),), (local_to_world().changed(),))
+                        .excl(lookat_target())
+                        .to_system(|q, world, qs, _| {
+                            for (_, (inv_local_to_world,), (local_to_world,)) in q.iter(world, qs) {
+                                *inv_local_to_world = local_to_world.inverse();
+                            }
+                        }),
                 ],
             ),
             parented_state_1: QueryState::new(),
@@ -374,12 +425,15 @@ impl TransformSystem {
     #[profiling::function]
     fn parented(&mut self, world: &mut World) {
         let mut changed_roots = HashSet::<EntityId>::new();
-        for (id, _) in query((local_to_parent().changed(),)).iter(world, Some(&mut self.parented_state_1)) {
+        for (id, _) in
+            query((local_to_parent().changed(),)).iter(world, Some(&mut self.parented_state_1))
+        {
             // TODO: This could be optimized
             changed_roots.insert(get_transform_root(world, id));
         }
-        for (id, (), (_, _)) in
-            query_mut((), (local_to_world().changed(), children())).excl(local_to_parent()).iter(world, Some(&mut self.parented_state_2))
+        for (id, (), (_, _)) in query_mut((), (local_to_world().changed(), children()))
+            .excl(local_to_parent())
+            .iter(world, Some(&mut self.parented_state_2))
         {
             changed_roots.insert(id);
         }
@@ -410,17 +464,23 @@ impl System for TransformSystem {
     fn run(&mut self, world: &mut World, event: &FrameEvent) {
         profiling::scope!("TransformSystem::run");
         self.systems.run(world, event);
-        if let Some(camera) = get_active_camera(world, main_scene(), world.resource_opt(local_user_id())) {
+        if let Some(camera) =
+            get_active_camera(world, main_scene(), world.resource_opt(local_user_id()))
+        {
             let inv_view = world.get(camera, local_to_world()).ok();
 
             if let Some(inv_view) = inv_view {
-                for (_, (local_to_world,), ()) in
-                    query_mut((local_to_world(),), ()).excl(local_to_parent()).incl(spherical_billboard()).iter(world, None)
+                for (_, (local_to_world,), ()) in query_mut((local_to_world(),), ())
+                    .excl(local_to_parent())
+                    .incl(spherical_billboard())
+                    .iter(world, None)
                 {
                     spherical_billboard_matrix(local_to_world, &inv_view);
                 }
-                for (_, (local_to_world,), ()) in
-                    query_mut((local_to_world(),), ()).excl(local_to_parent()).incl(cylindrical_billboard_z()).iter(world, None)
+                for (_, (local_to_world,), ()) in query_mut((local_to_world(),), ())
+                    .excl(local_to_parent())
+                    .incl(cylindrical_billboard_z())
+                    .iter(world, None)
                 {
                     cylindrical_billboard_z_matrix(local_to_world, &inv_view);
                 }
@@ -431,10 +491,15 @@ impl System for TransformSystem {
         self.post_parented_systems.run(world, event);
     }
 }
-pub fn transform_gpu_systems() -> SystemGroup<GpuWorldSyncEvent> {
+pub fn transform_gpu_systems(gpu: Arc<Gpu>) -> SystemGroup<GpuWorldSyncEvent> {
     SystemGroup::new(
         "transform_gpu",
-        vec![Box::new(ComponentToGpuSystem::new(GpuComponentFormat::Mat4, mesh_to_world(), gpu_components::mesh_to_world()))],
+        vec![Box::new(ComponentToGpuSystem::new(
+            gpu,
+            GpuComponentFormat::Mat4,
+            mesh_to_world(),
+            gpu_components::mesh_to_world(),
+        ))],
     )
 }
 fn update_transform_recursive(world: &mut World, id: EntityId, mut parent_transform: Mat4) {
@@ -456,23 +521,12 @@ fn update_transform_recursive(world: &mut World, id: EntityId, mut parent_transf
         }
     }
 }
-fn get_fbx_transform(world: &World, id: EntityId) -> Mat4 {
-    world.get(id, translation()).map(Mat4::from_translation).unwrap_or_default()
-        * world.get(id, fbx_rotation_offset()).map(Mat4::from_translation).unwrap_or_default()
-        * world.get(id, fbx_rotation_pivot()).map(Mat4::from_translation).unwrap_or_default()
-        * world.get(id, fbx_pre_rotation()).map(Mat4::from_quat).unwrap_or_default()
-        * world.get(id, rotation()).map(Mat4::from_quat).unwrap_or_default()
-        * world.get(id, fbx_post_rotation()).map(|v| Mat4::from_quat(v).inverse()).unwrap_or_default()
-        * world.get(id, fbx_rotation_pivot()).map(|x| Mat4::from_translation(x).inverse()).unwrap_or_default()
-        * world.get(id, fbx_scaling_offset()).map(Mat4::from_translation).unwrap_or_default()
-        * world.get(id, fbx_scaling_pivot()).map(Mat4::from_translation).unwrap_or_default()
-        * world.get(id, scale()).map(Mat4::from_scale).unwrap_or_default()
-        * world.get(id, fbx_scaling_pivot()).map(|x| Mat4::from_translation(x).inverse()).unwrap_or_default()
-}
 
 fn get_transform_root(world: &World, id: EntityId) -> EntityId {
     if let Ok(parent) = world.get_ref(id, parent()) {
-        if world.has_component(id, local_to_parent()) && world.has_component(*parent, local_to_world()) {
+        if world.has_component(id, local_to_parent())
+            && world.has_component(*parent, local_to_world())
+        {
             return get_transform_root(world, *parent);
         }
     }
@@ -510,11 +564,13 @@ pub fn get_world_transform(world: &World, entity: EntityId) -> Result<Mat4, ECSE
     match world.get(entity, local_to_world()) {
         Ok(ltw) => Ok(ltw),
         Err(err) => match err {
-            ECSError::EntityDoesntHaveComponent { .. } => Ok(Mat4::from_scale_rotation_translation(
-                world.get(entity, scale()).unwrap_or(Vec3::ONE),
-                world.get(entity, rotation()).unwrap_or(Quat::IDENTITY),
-                world.get(entity, translation()).unwrap_or(Vec3::ZERO),
-            )),
+            ECSError::EntityDoesntHaveComponent { .. } => {
+                Ok(Mat4::from_scale_rotation_translation(
+                    world.get(entity, scale()).unwrap_or(Vec3::ONE),
+                    world.get(entity, rotation()).unwrap_or(Quat::IDENTITY),
+                    world.get(entity, translation()).unwrap_or(Vec3::ZERO),
+                ))
+            }
             ECSError::NoSuchEntity { .. } => Err(err),
             ECSError::AddedResourceToEntity { .. } => Err(err),
         },

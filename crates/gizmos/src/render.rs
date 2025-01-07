@@ -3,30 +3,64 @@ use std::{fmt::Debug, sync::Arc};
 use ambient_core::{asset_cache, camera::Camera, main_scene, player::local_user_id};
 use ambient_ecs::World;
 use ambient_gpu::{
-    gpu::{Gpu, GpuKey},
+    gpu::Gpu,
     mesh_buffer::{GpuMesh, MeshBuffer},
     shader_module::{BindGroupDesc, GraphicsPipeline, GraphicsPipelineInfo, Shader, ShaderModule},
     typed_buffer::TypedBuffer,
 };
 use ambient_meshes::QuadMeshKey;
-use ambient_renderer::{get_overlay_modules, get_resources_module, RendererTarget, SubRenderer};
-use ambient_std::{
+use ambient_native_std::{
     asset_cache::{AssetCache, SyncAssetKeyExt},
     include_file,
+};
+use ambient_renderer::{
+    bind_groups::BindGroups, get_mesh_data_module, get_overlay_modules, PostSubmitFunc,
+    RendererTarget, SubRenderer, GLOBALS_BIND_GROUP, GLOBALS_BIND_GROUP_SIZE,
 };
 use bytemuck::{Pod, Zeroable};
 use glam::{vec2, Mat4, Quat, Vec2, Vec3};
 use once_cell::sync::OnceCell;
-use wgpu::{BindGroup, BindGroupEntry, BindGroupLayoutEntry, BlendState, BufferUsages, ColorTargetState, ColorWrites, ShaderStages};
+use wgpu::{
+    BindGroupEntry, BindGroupLayout, BindGroupLayoutEntry, BlendState, BufferUsages,
+    ColorTargetState, ColorWrites, ShaderStages,
+};
 
 use super::{gizmos, GizmoPrimitive};
 
+fn get_gizmos_layout() -> BindGroupDesc<'static> {
+    BindGroupDesc {
+        entries: vec![
+            BindGroupLayoutEntry {
+                binding: 0,
+                visibility: ShaderStages::VERTEX_FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            BindGroupLayoutEntry {
+                binding: 1,
+                visibility: ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Depth,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+        ],
+        label: "GIZMOS_BIND_GROUP".into(),
+    }
+}
+
 pub struct GizmoRenderer {
-    gpu: Arc<Gpu>,
     quad: Arc<GpuMesh>,
     pipeline: OnceCell<GraphicsPipeline>,
     buffer: TypedBuffer<Gizmo>,
     primitives: Vec<Gizmo>,
+    layout: Arc<BindGroupLayout>,
 }
 impl Debug for GizmoRenderer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -35,67 +69,73 @@ impl Debug for GizmoRenderer {
 }
 
 impl GizmoRenderer {
-    pub fn new(assets: &AssetCache) -> Self {
-        let gpu = GpuKey.get(assets);
-        let buffer =
-            TypedBuffer::new(gpu.clone(), "Gizmo Buffer", 128, 0, BufferUsages::STORAGE | BufferUsages::COPY_DST | BufferUsages::COPY_SRC);
+    pub fn new(gpu: &Gpu, assets: &AssetCache) -> Self {
+        let buffer = TypedBuffer::new(
+            gpu,
+            Some("Gizmo Buffer"),
+            128,
+            BufferUsages::STORAGE | BufferUsages::COPY_DST | BufferUsages::COPY_SRC,
+        );
 
-        Self { gpu, quad: QuadMeshKey.get(assets), pipeline: OnceCell::new(), buffer, primitives: Vec::new() }
+        let layout = get_gizmos_layout().get(assets);
+
+        Self {
+            quad: QuadMeshKey.get(assets),
+            pipeline: OnceCell::new(),
+            buffer,
+            primitives: Vec::new(),
+            layout,
+        }
     }
 }
+
 impl SubRenderer for GizmoRenderer {
     #[profiling::function]
     fn render<'a>(
         &'a mut self,
+        gpu: &Gpu,
         world: &World,
         mesh_buffer: &MeshBuffer,
         encoder: &mut wgpu::CommandEncoder,
         target: &RendererTarget,
-        binds: &[(&str, &'a BindGroup)],
+        bind_groups: &BindGroups<'a>,
+        _: &mut Vec<PostSubmitFunc>,
     ) {
         let gizmos = world.resource(gizmos());
-        let camera = Camera::get_active(world, main_scene(), world.resource_opt(local_user_id())).unwrap_or_default();
+        let camera = Camera::get_active(world, main_scene(), world.resource_opt(local_user_id()))
+            .unwrap_or_default();
         let primitives = &mut self.primitives;
 
         primitives.clear();
-        let assets = world.resource(asset_cache());
 
-        let gpu = &self.gpu;
+        gizmos.scopes().for_each(|scope| {
+            primitives.extend(
+                scope
+                    .primitives
+                    .iter()
+                    .map(|v| Gizmo::from_primitive(v, camera.position())),
+            );
+        });
+
+        if primitives.is_empty() {
+            return;
+        }
+
+        let assets = world.resource(asset_cache());
         let pipeline = self.pipeline.get_or_init(|| {
-            let layout = BindGroupDesc {
-                entries: vec![
-                    BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: ShaderStages::VERTEX_FRAGMENT,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: true },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
-                    BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Depth,
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            multisampled: false,
-                        },
-                        count: None,
-                    },
-                ],
-                label: "GIZMOS_BIND_GROUP".into(),
-            };
+            let layout = get_gizmos_layout();
 
             let source = include_file!("gizmos.wgsl");
-            let shader = Shader::from_modules(
+            let shader = Shader::new(
                 assets,
-                "Gizmo Shader",
-                get_overlay_modules(assets, 1)
-                    .iter()
-                    .chain([&get_resources_module(), &ShaderModule::new("Gizmo", source, vec![layout.into()])]),
-            );
+                "gizmos",
+                &[GLOBALS_BIND_GROUP, "GIZMOS_BIND_GROUP"],
+                &ShaderModule::new("Gizmo", source)
+                    .with_binding_desc(layout)
+                    .with_dependencies(get_overlay_modules(assets, 1))
+                    .with_dependency(get_mesh_data_module(GLOBALS_BIND_GROUP_SIZE)),
+            )
+            .unwrap();
 
             shader.to_pipeline(
                 gpu,
@@ -111,24 +151,24 @@ impl SubRenderer for GizmoRenderer {
             )
         });
 
-        gizmos.scopes().for_each(|scope| {
-            primitives.extend(scope.primitives.iter().map(|v| Gizmo::from_primitive(v, camera.position())));
-        });
-
-        if primitives.is_empty() {
-            return;
-        }
-
-        self.buffer.fill(primitives, |_| {
-            log::debug!("Resizing bind group for gizmos");
+        self.buffer.fill(gpu, primitives, |_| {
+            tracing::debug!("Resizing bind group for gizmos");
         });
 
         let bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Gizmo bind group"),
-            layout: pipeline.shader().get_bind_group_layout_by_name("GIZMOS_BIND_GROUP").unwrap(),
+            layout: &self.layout,
             entries: &[
-                BindGroupEntry { binding: 0, resource: wgpu::BindingResource::Buffer(self.buffer.buffer().as_entire_buffer_binding()) },
-                BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(target.depth()) },
+                BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::Buffer(
+                        self.buffer.buffer().as_entire_buffer_binding(),
+                    ),
+                },
+                BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(target.depth()),
+                },
             ],
         });
 
@@ -137,18 +177,25 @@ impl SubRenderer for GizmoRenderer {
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: target.color(),
                 resolve_target: None,
-                ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: true },
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: true,
+                },
             })],
             depth_stencil_attachment: None,
         });
 
-        render_pass.set_index_buffer(mesh_buffer.index_buffer.buffer().slice(..), wgpu::IndexFormat::Uint32);
+        render_pass.set_index_buffer(
+            mesh_buffer.index_buffer.buffer().slice(..),
+            wgpu::IndexFormat::Uint32,
+        );
 
         let indices = mesh_buffer.indices_of(&self.quad);
         render_pass.set_pipeline(pipeline.pipeline());
 
-        for (name, group) in binds.iter().chain([("GIZMOS_BIND_GROUP", &bind_group)].iter()) {
-            pipeline.bind(&mut render_pass, name, group);
+        let bind_groups = [bind_groups.globals, &bind_group];
+        for (index, bind_group) in bind_groups.iter().enumerate() {
+            render_pass.set_bind_group(index as _, bind_group, &[])
         }
 
         render_pass.draw_indexed(indices, 0, 0..primitives.len() as _);
@@ -169,7 +216,12 @@ struct Gizmo {
 impl Gizmo {
     pub fn from_primitive(prim: &GizmoPrimitive, camera_pos: Vec3) -> Self {
         match *prim {
-            GizmoPrimitive::Sphere { origin, radius, color, border_width } => Self {
+            GizmoPrimitive::Sphere {
+                origin,
+                radius,
+                color,
+                border_width,
+            } => Self {
                 model: Mat4::from_scale_rotation_translation(
                     Vec3::splat(radius),
                     Quat::from_rotation_arc(Vec3::Z, (origin - camera_pos).normalize()),
@@ -181,7 +233,12 @@ impl Gizmo {
                 scale: Vec2::splat(radius),
                 inner_corner: 1.,
             },
-            GizmoPrimitive::Line { start, end, radius, color } => {
+            GizmoPrimitive::Line {
+                start,
+                end,
+                radius,
+                color,
+            } => {
                 let dir = start - end;
                 let len = dir.length();
                 let dir = dir.normalize_or_zero();
@@ -194,7 +251,11 @@ impl Gizmo {
 
                 let scale = vec2(len * 0.5, radius);
                 Self {
-                    model: Mat4::from_scale_rotation_translation(scale.extend(0.), Quat::from_rotation_arc(tan, billboard) * rot, mid),
+                    model: Mat4::from_scale_rotation_translation(
+                        scale.extend(0.),
+                        Quat::from_rotation_arc(tan, billboard) * rot,
+                        mid,
+                    ),
                     color,
                     corner: 1.,
                     border_width: len,
@@ -202,8 +263,20 @@ impl Gizmo {
                     inner_corner: 0.0,
                 }
             }
-            GizmoPrimitive::Rect { origin, extents, corner: corner_radius, inner_corner, thickness, normal, color } => Self {
-                model: Mat4::from_scale_rotation_translation(extents.extend(0.), Quat::from_rotation_arc(Vec3::Z, normal), origin),
+            GizmoPrimitive::Rect {
+                origin,
+                extents,
+                corner: corner_radius,
+                inner_corner,
+                thickness,
+                normal,
+                color,
+            } => Self {
+                model: Mat4::from_scale_rotation_translation(
+                    extents.extend(0.),
+                    Quat::from_rotation_arc(Vec3::Z, normal),
+                    origin,
+                ),
                 color,
                 corner: corner_radius,
                 scale: extents,

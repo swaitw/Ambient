@@ -1,5 +1,5 @@
 [package]
-name = "screens"
+name = "ambient_example_screens"
 
 edition = "2021"
 publish = false
@@ -7,18 +7,11 @@ rust-version = { workspace = true }
 version = { workspace = true }
 
 [dependencies]
-ambient_api = { path = "../../../api" }
-ambient_element = { path = "../../../../../crates/element", default-features = false, features = [
-  "guest",
-] }
-ambient_guest_bridge = { path = "../../../../../crates/guest_bridge", default-features = false, features = [
-  "guest",
-] }
-ambient_ui_components = { path = "../../../../../crates/ui_components", features = [
-  "guest",
-] }
-ambient_cb = { path = "../../../../../libs/cb" }
-ambient_friendly_id = { path = "../../../../../libs/friendly_id" }
+ambient_api = { workspace = true }
+ambient_friendly_id = { workspace = true }
+
+[build-dependencies]
+ambient_package_projection = { workspace = true }
 
 [[bin]]
 name = "screens_client"

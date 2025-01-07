@@ -1,9 +1,11 @@
 use std::sync::Arc;
 
-use ambient_std::asset_cache::SyncAssetKey;
+use ambient_native_std::asset_cache::SyncAssetKey;
+use ambient_settings::RenderSettings;
+use anyhow::Context;
 use bytemuck::{Pod, Zeroable};
 use glam::{uvec2, UVec2, UVec3, UVec4, Vec2, Vec3, Vec4};
-use wgpu::{PresentMode, TextureFormat};
+use wgpu::{InstanceDescriptor, PresentMode, TextureFormat};
 use winit::window::Window;
 
 // #[cfg(debug_assertions)]
@@ -26,12 +28,17 @@ pub struct Gpu {
     /// If this is true, we don't need to use blocking device.polls, since they are assumed to be polled elsewhere
     pub will_be_polled: bool,
 }
+
 impl Gpu {
-    pub async fn new(window: Option<&Window>) -> Self {
-        Self::with_config(window, false).await
+    pub async fn new(window: Option<&Window>) -> anyhow::Result<Self> {
+        Self::with_config(window, false, &RenderSettings::default()).await
     }
-    #[tracing::instrument(level = "info")]
-    pub async fn with_config(window: Option<&Window>, will_be_polled: bool) -> Self {
+    pub async fn with_config(
+        window: Option<&Window>,
+        will_be_polled: bool,
+        settings: &RenderSettings,
+    ) -> anyhow::Result<Self> {
+        let _span = tracing::info_span!("create_gpu").entered();
         // From: https://github.com/KhronosGroup/Vulkan-Loader/issues/552
         #[cfg(not(target_os = "unknown"))]
         {
@@ -39,17 +46,37 @@ impl Gpu {
             std::env::set_var("DISABLE_LAYER_NV_OPTIMUS_1", "1");
         }
 
-        #[cfg(target_os = "windows")]
-        let backend = wgpu::Backends::VULKAN;
+        let backends = if cfg!(target_os = "windows") {
+            wgpu::Backends::VULKAN
+        } else if cfg!(target_os = "macos") {
+            wgpu::Backends::PRIMARY
+        } else if cfg!(target_os = "unknown") {
+            wgpu::Backends::BROWSER_WEBGPU
+        } else {
+            wgpu::Backends::all()
+        };
 
-        #[cfg(all(not(target_os = "windows"), not(target_os = "unknown")))]
-        let backend = wgpu::Backends::PRIMARY;
+        let instance = wgpu::Instance::new(InstanceDescriptor {
+            backends,
+            // NOTE: Vulkan is used for windows as a non-zero indirect `first_instance` is not supported, and we have to resort direct rendering
+            // See: <https://github.com/gfx-rs/wgpu/issues/2471>
+            //
+            // TODO: upgrade to Dxc? This requires us to ship additionall dll files, which may be
+            // possible using an installer. Nevertheless, we are currently using Vulkan on windows
+            // due to `base_instance` being broken on windows.
+            // https://docs.rs/wgpu/latest/wgpu/enum.Dx12Compiler.html
+            dx12_shader_compiler: wgpu::Dx12Compiler::Fxc,
+            // dx12_shader_compiler: wgpu::Dx12Compiler::Dxc {
+            //     dxil_path: Some("./dxil.dll".into()),
+            //     dxc_path: Some("./dxcompiler.dll".into()),
+            // },
+        });
 
-        #[cfg(target_os = "unknown")]
-        let backend = wgpu::Backends::all();
+        let surface = window
+            .map(|window| unsafe { instance.create_surface(window) })
+            .transpose()
+            .context("Failed to create surface")?;
 
-        let instance = wgpu::Instance::new(backend);
-        let surface = window.map(|window| unsafe { instance.create_surface(window) });
         #[cfg(not(target_os = "unknown"))]
         {
             tracing::debug!("Available adapters:");
@@ -66,17 +93,35 @@ impl Gpu {
                 force_fallback_adapter: false,
             })
             .await
-            .expect("Failed to find an appropriate adapter");
+            .context("Failed to find an appopriate adapter")?;
 
-        tracing::debug!("Using gpu adapter: {:?}", adapter.get_info());
+        tracing::info!("Using gpu adapter: {:?}", adapter.get_info());
+
         tracing::debug!("Adapter features:\n{:#?}", adapter.features());
         let adapter_limits = adapter.limits();
         tracing::debug!("Adapter limits:\n{:#?}", adapter_limits);
 
-        #[cfg(target_os = "macos")]
-        let features = wgpu::Features::empty();
-        #[cfg(not(target_os = "macos"))]
-        let features = wgpu::Features::MULTI_DRAW_INDIRECT | wgpu::Features::MULTI_DRAW_INDIRECT_COUNT;
+        cfg_if::cfg_if! {
+            if #[cfg(target_os = "macos")] {
+                // The renderer will dispatch 1 indirect draw command for *each* primitive in the
+                // scene, but the data draw data such as index_count, first_instance, etc lives on
+                // the gpu
+                let features = wgpu::Features::empty();
+            } else if #[cfg(target_os = "unknown")] {
+
+                // Same as above, but the *web*gpu target requires a feature flag to be set, or
+                // else indirect commands no-op
+                let features = wgpu::Features::INDIRECT_FIRST_INSTANCE;
+            } else {
+                // TODO: make configurable at runtime
+                // The renderer will use indirect drawing with the draw commands *and* count
+                // fetched from gpu side buffers
+                let features =
+                wgpu::Features::MULTI_DRAW_INDIRECT | wgpu::Features::MULTI_DRAW_INDIRECT_COUNT;
+            }
+        };
+
+        tracing::info!("Using device features: {features:?}");
 
         let (device, queue) = adapter
             .request_device(
@@ -88,46 +133,71 @@ impl Gpu {
                         | features,
                     limits: wgpu::Limits {
                         max_bind_groups: 8,
-                        max_storage_buffer_binding_size: adapter_limits.max_storage_buffer_binding_size,
+                        max_storage_buffer_binding_size: adapter_limits
+                            .max_storage_buffer_binding_size,
                         ..Default::default()
                     },
                 },
                 None,
             )
             .await
-            .expect("Failed to create device");
+            .context("Failed to request a device")?;
 
-        tracing::info!("Device limits:\n{:#?}", device.limits());
+        tracing::debug!("Device limits:\n{:#?}", device.limits());
 
-        let swapchain_format = surface.as_ref().map(|surface| surface.get_supported_formats(&adapter)[0]);
+        let swapchain_format = surface
+            .as_ref()
+            .map(|surface| surface.get_capabilities(&adapter).formats[0]);
+
         tracing::debug!("Swapchain format: {swapchain_format:?}");
-        let swapchain_mode = surface.as_ref().map(|surface| surface.get_supported_present_modes(&adapter)).as_ref().map(|modes| {
-            [PresentMode::Immediate, PresentMode::Fifo, PresentMode::Mailbox]
-                .into_iter()
-                .find(|pm| modes.contains(pm))
-                .expect("unable to find compatible swapchain mode")
-        });
+
+        let swapchain_mode = if surface.is_some() {
+            if settings.vsync() {
+                // From wgpu docs:
+                // "Chooses FifoRelaxed -> Fifo based on availability."
+                Some(PresentMode::AutoVsync)
+            } else {
+                // From wgpu docs:
+                // "Chooses Immediate -> Mailbox -> Fifo (on web) based on availability."
+                Some(PresentMode::AutoNoVsync)
+            }
+        } else {
+            None
+        };
+
         tracing::debug!("Swapchain present mode: {swapchain_mode:?}");
 
-        if let (Some(window), Some(surface), Some(mode), Some(format)) = (window, &surface, swapchain_mode, swapchain_format) {
+        if let (Some(window), Some(surface), Some(mode), Some(format)) =
+            (window, &surface, swapchain_mode, swapchain_format)
+        {
             let size = window.inner_size();
-            surface.configure(&device, &Self::create_sc_desc(format, mode, uvec2(size.width, size.height)));
+            surface.configure(
+                &device,
+                &Self::create_sc_desc(format, mode, uvec2(size.width, size.height)),
+            );
         }
-        tracing::debug!("Created gpu");
 
-        Self { device, surface, queue, swapchain_format, swapchain_mode, adapter, will_be_polled }
+        Ok(Self {
+            device,
+            surface,
+            queue,
+            swapchain_format,
+            swapchain_mode,
+            adapter,
+            will_be_polled,
+        })
     }
 
     pub fn resize(&self, size: winit::dpi::PhysicalSize<u32>) {
         if let Some(surface) = &self.surface {
             if size.width > 0 && size.height > 0 {
-                tracing::info!("Resizing to {size:?}");
                 surface.configure(&self.device, &self.sc_desc(uvec2(size.width, size.height)));
             }
         }
     }
     pub fn swapchain_format(&self) -> TextureFormat {
-        self.swapchain_format.unwrap_or(TextureFormat::Rgba8UnormSrgb)
+        self.swapchain_format
+            .unwrap_or(TextureFormat::Rgba8UnormSrgb)
     }
     pub fn swapchain_mode(&self) -> PresentMode {
         self.swapchain_mode.unwrap_or(PresentMode::Immediate)
@@ -135,7 +205,11 @@ impl Gpu {
     pub fn sc_desc(&self, size: UVec2) -> wgpu::SurfaceConfiguration {
         Self::create_sc_desc(self.swapchain_format(), self.swapchain_mode(), size)
     }
-    fn create_sc_desc(format: TextureFormat, present_mode: PresentMode, size: UVec2) -> wgpu::SurfaceConfiguration {
+    fn create_sc_desc(
+        format: TextureFormat,
+        present_mode: PresentMode,
+        size: UVec2,
+    ) -> wgpu::SurfaceConfiguration {
         wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,
@@ -143,6 +217,7 @@ impl Gpu {
             height: size.y,
             present_mode,
             alpha_mode: wgpu::CompositeAlphaMode::Auto,
+            view_formats: vec![],
         }
     }
 }

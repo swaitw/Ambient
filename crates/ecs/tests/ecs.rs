@@ -1,4 +1,7 @@
-use ambient_ecs::{components, query, query_mut, ECSError, Entity, EntityId, Query, QueryState, Resource, World};
+use ambient_ecs::{
+    components, query, query_mut, ECSError, Entity, EntityId, Query, QueryState, Resource, World,
+    WorldContext,
+};
 use itertools::Itertools;
 
 components!("test", {
@@ -20,7 +23,7 @@ fn init() {
 #[should_panic]
 fn unsound() {
     init();
-    let mut world = World::new("unsound");
+    let mut world = World::new_unknown("unsound");
     let query = query_mut(a(), a());
 
     world.spawn(Entity::new().with(a(), 5.0));
@@ -39,7 +42,7 @@ fn unsound() {
 #[test]
 fn remove() {
     init();
-    let mut world = World::new("remove");
+    let mut world = World::new_unknown("remove");
     let a = world.spawn(Entity::new().with(test(), "a"));
     let b = world.spawn(Entity::new().with(test2(), "b"));
     world.despawn(a);
@@ -49,32 +52,41 @@ fn remove() {
 #[test]
 fn iter_gap() {
     init();
-    let mut world = World::new("iter_gap");
+    let mut world = World::new_unknown("iter_gap");
     let _a = world.spawn(Entity::new().with(test(), "a"));
     let b = world.spawn(Entity::new().with(test(), "b"));
     let _c = world.spawn(Entity::new().with(test(), "c"));
     world.despawn(b);
-    let entities = query((test(),)).iter(&world, None).map(|(_, (test,))| *test).collect_vec();
+    let entities = query((test(),))
+        .iter(&world, None)
+        .map(|(_, (test,))| *test)
+        .collect_vec();
     assert_eq!(&["a", "c"], &entities[..]);
 }
 
 #[test]
 fn add_component() {
     init();
-    let mut world = World::new("add_component");
+    let mut world = World::new_unknown("add_component");
     let x = world.spawn(Entity::new().with(a(), 0.));
     world.add_component(x, b(), 1.).unwrap();
     assert_eq!(1., world.get(x, b()).unwrap());
-    let a_changed = query((a().changed(),)).iter(&world, Some(&mut QueryState::new())).map(|(id, _)| id).collect_vec();
+    let a_changed = query((a().changed(),))
+        .iter(&world, Some(&mut QueryState::new()))
+        .map(|(id, _)| id)
+        .collect_vec();
     assert_eq!(&[x] as &[EntityId], &a_changed[..]);
-    let b_changed = query((b().changed(),)).iter(&world, Some(&mut QueryState::new())).map(|(id, _)| id).collect_vec();
+    let b_changed = query((b().changed(),))
+        .iter(&world, Some(&mut QueryState::new()))
+        .map(|(id, _)| id)
+        .collect_vec();
     assert_eq!(&[x], &b_changed[..]);
 }
 
 #[test]
 fn remove_component() {
     init();
-    let mut world = World::new("remove_component");
+    let mut world = World::new_unknown("remove_component");
     let x = world.spawn(Entity::new().with(a(), 0.).with(b(), 0.));
     assert_eq!(world.get_components(x).unwrap().len(), 2);
     world.remove_component(x, a()).unwrap();
@@ -86,7 +98,7 @@ fn remove_component() {
 #[test]
 fn spawn_all_excl_query() {
     init();
-    let mut world = World::new("spawn_all_excl_query");
+    let mut world = World::new_unknown("spawn_all_excl_query");
     let mut qs = QueryState::new();
     let q = Query::all().excl(a()).spawned();
     assert_eq!(q.iter(&world, Some(&mut qs)).count(), 1); // resources
@@ -101,7 +113,7 @@ fn spawn_all_excl_query() {
 #[test]
 fn query_created_late() {
     init();
-    let mut world = World::new("query_create_late");
+    let mut world = World::new_unknown("query_create_late");
     let _e_a = world.spawn(Entity::new().with(a(), 1.));
     // Simulation runs for a while first
     for _ in 0..500 {
@@ -109,16 +121,38 @@ fn query_created_late() {
     }
     let mut qs_change = QueryState::new();
     let mut qs_spawn = QueryState::new();
-    assert_eq!(query((a(),)).spawned().iter(&world, Some(&mut qs_spawn)).count(), 1);
-    assert_eq!(query((a(),)).spawned().iter(&world, Some(&mut qs_spawn)).count(), 0);
-    assert_eq!(query((a().changed(),)).iter(&world, Some(&mut qs_change)).count(), 1);
-    assert_eq!(query((a().changed(),)).iter(&world, Some(&mut qs_change)).count(), 0);
+    assert_eq!(
+        query((a(),))
+            .spawned()
+            .iter(&world, Some(&mut qs_spawn))
+            .count(),
+        1
+    );
+    assert_eq!(
+        query((a(),))
+            .spawned()
+            .iter(&world, Some(&mut qs_spawn))
+            .count(),
+        0
+    );
+    assert_eq!(
+        query((a().changed(),))
+            .iter(&world, Some(&mut qs_change))
+            .count(),
+        1
+    );
+    assert_eq!(
+        query((a().changed(),))
+            .iter(&world, Some(&mut qs_change))
+            .count(),
+        0
+    );
 }
 
 #[test]
 fn remove_despawn() {
     init();
-    let mut world = World::new("remove_despawn");
+    let mut world = World::new_unknown("remove_despawn");
     let x = world.spawn(Entity::new().with(a(), 0.));
     let y = world.spawn(Entity::new().with(a(), 0.));
     world.remove_component(x, a()).unwrap();
@@ -128,7 +162,7 @@ fn remove_despawn() {
 #[test]
 fn mirroring() {
     init();
-    let mut world = World::new("mirroring");
+    let mut world = World::new_unknown("mirroring");
     let id1 = EntityId(5);
     let id1b = EntityId(7);
     let id2 = EntityId(9);
@@ -150,23 +184,35 @@ fn mirroring() {
 #[test]
 fn content_version_should_remain_on_remove() {
     init();
-    let mut world = World::new("content_version_should_remain_one");
+    let mut world = World::new_unknown("content_version_should_remain_one");
     let x = Entity::new().with(a(), 5.).with(b(), 2.).spawn(&mut world);
     let y = Entity::new().with(a(), 5.).with(b(), 2.).spawn(&mut world);
     let x_start = world.get_component_content_version(x, a().index()).unwrap();
     let y_start = world.get_component_content_version(y, a().index()).unwrap();
     world.remove_component(x, b()).unwrap();
-    assert_eq!(x_start, world.get_component_content_version(x, a().index()).unwrap());
-    assert_eq!(y_start, world.get_component_content_version(y, a().index()).unwrap());
+    assert_eq!(
+        x_start,
+        world.get_component_content_version(x, a().index()).unwrap()
+    );
+    assert_eq!(
+        y_start,
+        world.get_component_content_version(y, a().index()).unwrap()
+    );
     world.remove_component(y, b()).unwrap();
-    assert_eq!(x_start, world.get_component_content_version(x, a().index()).unwrap());
-    assert_eq!(y_start, world.get_component_content_version(y, a().index()).unwrap());
+    assert_eq!(
+        x_start,
+        world.get_component_content_version(x, a().index()).unwrap()
+    );
+    assert_eq!(
+        y_start,
+        world.get_component_content_version(y, a().index()).unwrap()
+    );
 }
 
 #[test]
 fn no_resources() {
     init();
-    let world = World::new_with_config("no_resources", false);
+    let world = World::new_with_config("no_resources", WorldContext::Unknown, false);
     assert!(!world.exists(world.resource_entity()));
     assert!(world.resource_opt(a()).is_none());
 }
@@ -179,16 +225,30 @@ fn fresh_moveout_event_reader_should_work() {
     // This test checks that this is no longer the case.
 
     init();
-    let mut world = World::new_with_config("fresh_moveout_event_reader_should_work", false);
+    let mut world = World::new_with_config(
+        "fresh_moveout_event_reader_should_work",
+        WorldContext::Unknown,
+        false,
+    );
 
     // Ensure that spawn queries work correctly.
     let mut spawn_query_state = QueryState::new();
     let spawn_query = query(a()).spawned();
-    assert_eq!(spawn_query.iter(&world, Some(&mut spawn_query_state)).count(), 0);
+    assert_eq!(
+        spawn_query
+            .iter(&world, Some(&mut spawn_query_state))
+            .count(),
+        0
+    );
 
     let id = Entity::new().with(a(), 5.).with(b(), 2.).spawn(&mut world);
 
-    assert_eq!(spawn_query.iter(&world, Some(&mut spawn_query_state)).count(), 1);
+    assert_eq!(
+        spawn_query
+            .iter(&world, Some(&mut spawn_query_state))
+            .count(),
+        1
+    );
 
     // Simulate `HISTORY_SIZE` number of frames to ensure that start_frame is incremented
     // for each archetype's moveout events, such that when the query runs, start_frame
@@ -200,25 +260,38 @@ fn fresh_moveout_event_reader_should_work() {
     // Check that the despawn query executes without panicking.
     let mut despawn_query_state = QueryState::new();
     let despawn_query = query(a()).despawned();
-    assert_eq!(despawn_query.iter(&world, Some(&mut despawn_query_state)).count(), 0);
+    assert_eq!(
+        despawn_query
+            .iter(&world, Some(&mut despawn_query_state))
+            .count(),
+        0
+    );
 
     world.despawn(id);
-    assert_eq!(despawn_query.iter(&world, Some(&mut despawn_query_state)).count(), 1);
+    assert_eq!(
+        despawn_query
+            .iter(&world, Some(&mut despawn_query_state))
+            .count(),
+        1
+    );
 }
 
 #[test]
 fn errors_on_adding_a_resource_to_an_entity() {
     init();
-    let mut world = World::new("errors_on_adding_a_resource_to_an_entity");
+    let mut world = World::new_unknown("errors_on_adding_a_resource_to_an_entity");
     let entity_id = world.spawn(Entity::new());
     assert_eq!(
         world.add_component(entity_id, a_resource(), ()),
-        Err(ECSError::AddedResourceToEntity { component_path: "core::test::a_resource".to_string(), entity_id })
+        Err(ECSError::AddedResourceToEntity {
+            component_path: "ambient_core::test::a_resource".to_string(),
+            entity_id
+        })
     );
 }
 
 #[test]
 fn can_add_a_resource() {
     init();
-    World::new("can_add_a_resource").add_resource(a_resource(), ());
+    World::new_unknown("can_add_a_resource").add_resource(a_resource(), ());
 }

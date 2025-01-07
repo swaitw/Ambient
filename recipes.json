@@ -1,42 +1,322 @@
 {
-    "client": {
-        "cmd": "cargo run -p ambient"
-    },
-    "third-person-camera-release": {
-        "cmd": "cargo run --release -- run guest/rust/examples/third_person_camera"
-    },
-    "third-person-camera": {
-        "cmd": "cargo run -- run guest/rust/examples/third_person_camera"
-    },
-    "debug-third-person-camera": {
-        "cmd": "cargo build -p ambient",
-        "components": {
-            "dap": {
-                "program": "./target/debug/ambient",
-                "adapter": "rust",
-                "args": [
-                    "run",
-                    "./guest/rust/examples/third_person_camera"
-                ]
-            }
-        }
-    },
-    "build-web": {
-        "cmd": "wasm-pack build web --dev",
-        "components": {
-            "qf": {
-                "compiler": "cargo"
-            }
-        }
-    },
-    "check-tests": {
-        "cmd": "cargo check --workspace --tests --examples"
-    },
-    "run-web": {
-        "cmd": "npm run start --open",
-        "cwd": "www",
-        "env": {
-            "RUST_LOG": "info"
-        }
+  "check": {
+    "cmd": "cargo check"
+  },
+  "clippy web": {
+    "cmd": [
+      "cargo",
+      "clippy",
+      "--workspace"
+    ],
+    "cwd": "web"
+  },
+  "client": {
+    "cmd": "cargo run -p ambient"
+  },
+  "third-person-camera-release": {
+    "cmd": "cargo run --release -- run ./guest/rust/examples/controllers/third_person_camera"
+  },
+  "third-person-camera": {
+    "cmd": "cargo run --features tracing-tree -- run ./guest/rust/examples/controllers/third_person_camera --debugger"
+  },
+  "primitives": {
+    "cmd": "cargo run -- run ./guest/rust/examples/basics/primitives/"
+  },
+  "gi-samplers": {
+    "cmd": "cargo run --release -- run --release guest/rust/examples/basics/samplers --headless --no-proxy --quic-interface-port 9009 --http-interface-port 10009 golden-image-check --timeout-seconds 30.0",
+    "env": {
+      "RUST_LOG": "ambient_network=debug,ambient_wasm=debug,ambient=debug,ambient_ecs=info,ambient_renderer=warn,ambient_native_std=debug,ambient_network::client_game_state=info,ambient_element=warn,ambient_app=warn,info"
     }
+  },
+  "join": {
+    "cmd": [
+      "cargo",
+      "run",
+      "join",
+      "localhost:9000",
+      "--debugger"
+    ],
+    "env": {
+      "RUST_LOG": "info"
+    }
+  },
+  "join-release": {
+    "cmd": [
+      "cargo",
+      "run",
+      "--features",
+      "profile",
+      "--release",
+      "join",
+      "localhost:9000",
+      "--debugger"
+    ]
+  },
+  "debug-join": {
+    "cmd": [
+      "cargo",
+      "build",
+      "--message-format=json",
+      "--features",
+      "tracing"
+    ],
+    "components": {
+      "cargo-dap": {
+        "adapter": "rust",
+        "args": [
+          "join",
+          "localhost:9000",
+          "--debugger"
+        ],
+        "env": {
+          "RUST_LOG": "ambient_renderer=debug,ambient_gpu=debug,info"
+        }
+      }
+    }
+  },
+  "material overriding": {
+    "cmd": "cargo run -- run --release ./guest/rust/examples/assets/material_overriding --clean-build",
+    "env": {
+      "RUST_LOG": "info"
+    }
+  },
+  "serve-primitives": {
+    "cmd": "cargo run -- serve ./guest/rust/examples/basics/primitives/",
+    "env": {
+      "RUST_LOG": "ambient_network=debug,info"
+    }
+  },
+  "serve-procedural": {
+    "cmd": "cargo run -- serve ./guest/rust/examples/basics/procedural_generation/",
+    "env": {
+      "RUST_LOG": "ambient_network=debug,info"
+    }
+  },
+  "serve physics": {
+    "cmd": "cargo run -- serve ./guest/rust/examples/basics/physics/ --clean-build",
+    "env": {
+      "RUST_LOG": "ambient_network=debug,info"
+    }
+  },
+  "serve third-person-camera release": {
+    "cmd": "cargo run --release serve --release ./guest/rust/examples/controllers/third_person_camera/ --clean-build"
+  },
+  "serve tangent release": {
+    "cmd": "cargo run --release serve --release ./guest/rust/packages/games/tangent/ --clean-build"
+  },
+  "serve-third-person-camera": {
+    "cmd": "cargo run serve --release ./guest/rust/examples/controllers/third_person_camera/ --clean-build"
+  },
+  "samplers": {
+    "cmd": [
+      "cargo",
+      "run",
+      "--features",
+      "tracing",
+      "--",
+      "serve",
+      "./guest/rust/examples/basics/samplers/"
+    ],
+    "env": {
+      "RUST_LOG": "ambient_network=debug,info"
+    }
+  },
+  "debug-physics": {
+    "cmd": [
+      "cargo",
+      "build",
+      "--features",
+      "tracing"
+    ],
+    "components": {
+      "dap": {
+        "program": "./target/debug/ambient",
+        "adapter": "rust",
+        "args": [
+          "run",
+          "--mute-audio",
+          "./guest/rust/examples/basics/physics/"
+        ]
+      }
+    }
+  },
+  "debug-samplers": {
+    "cmd": [
+      "cargo",
+      "build",
+      "--message-format=json",
+      "--features",
+      "tracing"
+    ],
+    "components": {
+      "cargo-dap": {
+        "args": [
+          "run",
+          "./guest/rust/examples/basics/samplers/"
+        ]
+      }
+    },
+    "env": {
+      "RUST_LOG": "ambient_network=debug,info"
+    }
+  },
+  "minigolf": {
+    "cmd": "cargo run -- run ./guest/rust/packages/games/minigolf"
+  },
+  "minigolf-release": {
+    "cmd": "cargo run --release -- run --release ./guest/rust/packages/games/minigolf"
+  },
+  "tictactoe": {
+    "cmd": "cargo run -- run ./guest/rust/packages/games/tictactoe"
+  },
+  "fog": {
+    "cmd": "cargo run -- run --release ./guest/rust/examples/rendering/fog --clean-build"
+  },
+  "run text": {
+    "cmd": "cargo run -- run --release ./guest/rust/examples/ui/text --clean-build"
+  },
+  "skinmesh": {
+    "cmd": "cargo run -- run ./guest/rust/examples/basics/skinmesh"
+  },
+  "debug-third-person-camera": {
+    "cmd": "cargo build -p ambient --features tracing",
+    "components": {
+      "dap": {
+        "program": "./target/debug/ambient",
+        "adapter": "rust",
+        "justMyCode": true,
+        "args": [
+          "run",
+          "./guest/rust/examples/controllers/third_person_camera"
+        ]
+      }
+    }
+  },
+  "debug-minigolf": {
+    "cmd": "cargo build -p ambient",
+    "components": {
+      "dap": {
+        "program": "./target/debug/ambient",
+        "adapter": "rust",
+        "args": [
+          "run",
+          "./guest/rust/packages/games/minigolf"
+        ]
+      }
+    }
+  },
+  "debug-pbr": {
+    "cmd": "cargo build -p ambient_renderer --example pbr",
+    "components": {
+      "dap": {
+        "program": "./target/debug/examples/pbr",
+        "adapter": "rust"
+      }
+    }
+  },
+  "pbr": {
+    "cmd": "cargo run -p ambient_renderer --example pbr"
+  },
+  "check-all": {
+    "cmd": "cargo check --workspace --all-targets"
+  },
+  "test": {
+    "cmd": "cargo nextest run --workspace"
+  },
+  "client-spatial": {
+    "cmd": [
+      "cargo",
+      "build",
+      "--message-format=json",
+      "--package",
+      "ambient_world_audio",
+      "--example",
+      "client_spatial",
+      "--"
+    ],
+    "components": {
+      "cargo-dap": {}
+    }
+  },
+  "open-browser": {
+    "cmd": "cargo cf web open-browser"
+  },
+  "build web": {
+    "cmd": "cargo cf web build"
+  },
+  "build web release": {
+    "cmd": "cargo cf web build --profile profiling"
+  },
+  "check web": {
+    "cmd": "cargo cf web check"
+  },
+  "serve web": {
+    "cmd": "cargo cf web serve",
+    "env": {
+      "RUST_LOG": "info"
+    }
+  },
+  "serve web release": {
+    "cmd": "cargo cf web serve --profile profiling",
+    "env": {
+      "RUST_LOG": "info"
+    }
+  },
+  "run": {
+    "cmd": "npm run dev",
+    "cwd": "web/www",
+    "env": {
+      "RUST_LOG": "info"
+    }
+  },
+  "migrate-pipelines-toml": {
+    "cmd": [
+      "cargo",
+      "run",
+      "--",
+      "assets",
+      "guest/rust/examples/basics/asset_loading",
+      "migrate-pipelines-toml"
+    ],
+    "env": {
+      "RUST_LOG": "ambient_build=info"
+    }
+  },
+  "instancing": {
+    "cmd": [
+      "cargo",
+      "run",
+      "--features",
+      "tracing",
+      "--",
+      "run",
+      "./guest/rust/examples/basics/instancing",
+      "--clean-build"
+    ]
+  },
+  "instancing-release": {
+    "cmd": [
+      "cargo",
+      "run",
+      "--features",
+      "tracing",
+      "--release",
+      "--",
+      "run",
+      "./guest/rust/examples/basics/instancing",
+      "--clean-build",
+      "--release"
+    ]
+  },
+  "golden-images": {
+    "cmd": [
+      "cargo",
+      "cf",
+      "golden-images",
+      "check"
+    ],
+    "env": {
+      "RUST_LOG": "ambient_network=debug,ambient=debug,info"
+    }
+  }
 }

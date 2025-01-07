@@ -1,6 +1,6 @@
 use futures::{future::LocalBoxFuture, stream::FuturesUnordered, FutureExt, StreamExt};
 use once_cell::sync::Lazy;
-use std::{future::Future, task::Poll};
+use std::{future::Future, pin::Pin, task::Poll};
 
 use crate::{
     control::{control_deferred, ControlHandle},
@@ -35,10 +35,10 @@ static LOCAL_WORKER: Lazy<flume::Sender<NonSendCons>> = Lazy::new(|| {
             loop {
                 tokio::select! {
                     Some(()) = set.next() => {
-                        tracing::info!("Local future completed");
+                        tracing::trace!("Local future completed");
                     },
                     Some(task) = rx.next() => {
-                        tracing::info!("Received new future");
+                        tracing::trace!("Received new future");
                         set.push(task());
                     },
                 }
@@ -63,7 +63,10 @@ impl<T> JoinHandle<T> {
 impl<T> Future for JoinHandle<T> {
     type Output = Result<T, JoinError>;
 
-    fn poll(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Self::Output> {
         match self.0.poll_unpin(cx) {
             Poll::Ready(Ok(value)) => Poll::Ready(Ok(value)),
             Poll::Ready(Err(err)) if err.is_panic() => Poll::Ready(Err(JoinError::Panicked)),
@@ -82,12 +85,15 @@ where
 {
     let (ctl, reg) = control_deferred();
 
-    LOCAL_WORKER.send(Box::new(move || Box::pin(reg.control(func())))).expect("Worker thread terminated");
+    LOCAL_WORKER
+        .send(Box::new(move || Box::pin(reg.control(func()))))
+        .expect("Worker thread terminated");
 
     ctl
 }
 
 #[inline(always)]
+/// Wraps a constructor function to send and construct the future on a worker thread
 pub async fn wasm_nonsend<F, Fut, T>(func: F) -> T
 where
     F: 'static + FnOnce() -> Fut + Send,
@@ -95,6 +101,18 @@ where
     T: 'static + Send,
 {
     func().await
+}
+
+/// This builds a Tokio multithreaded runtime for use in Ambient native contexts.
+///
+/// This function is *not* available in wasm-unknown contexts. Be careful in where and how you use it.
+///
+/// This function exists as a workaround to allow native users of this crate to be able to
+/// construct a runtime without having to depend on the `tokio` crate directly.
+pub fn make_native_multithreaded_runtime() -> std::io::Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
 }
 
 #[derive(Debug, Clone)]
@@ -130,10 +148,36 @@ impl RuntimeHandle {
     {
         JoinHandle(self.0.spawn_blocking(f))
     }
+
+    pub fn block_on<F: Future>(&self, future: F) -> F::Output {
+        self.0.block_on(future)
+    }
 }
 
 impl From<tokio::runtime::Handle> for crate::task::RuntimeHandle {
     fn from(value: tokio::runtime::Handle) -> Self {
         Self(RuntimeHandle(value))
+    }
+}
+
+pub(crate) struct PlatformBoxFutureImpl<'a, T>(Pin<Box<dyn Future<Output = T> + Send + 'a>>);
+
+impl<'a, T> PlatformBoxFutureImpl<'a, T> {
+    pub fn from_boxed(fut: Pin<Box<dyn Future<Output = T> + Send + 'a>>) -> Self {
+        Self(fut)
+    }
+
+    #[inline]
+    pub fn into_shared(self) -> Pin<Box<dyn Future<Output = T> + Send + 'a>> {
+        self.0
+    }
+}
+
+impl<'a, T> Future for PlatformBoxFutureImpl<'a, T> {
+    type Output = T;
+
+    #[inline]
+    fn poll(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+        self.0.poll_unpin(cx)
     }
 }

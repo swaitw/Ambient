@@ -1,4 +1,4 @@
-use ambient_std::mesh::Mesh;
+use ambient_native_std::mesh::{generate_tangents, Mesh, MeshBuilder};
 use glam::*;
 
 #[derive(Debug, Clone)]
@@ -37,8 +37,15 @@ impl From<&GridMesh> for Mesh {
         let mut indices = Vec::new();
         for y in 0..grid.n_vertices_height {
             for x in 0..grid.n_vertices_width {
-                let p = glam::Vec2::new(x as f32 / (grid.n_vertices_width as f32 - 1.0), y as f32 / (grid.n_vertices_height as f32 - 1.0));
-                positions.push(vec3(grid.top_left.x + grid.size.x * p.x, grid.top_left.y + grid.size.y * p.y, 0.));
+                let p = glam::Vec2::new(
+                    x as f32 / (grid.n_vertices_width as f32 - 1.0),
+                    y as f32 / (grid.n_vertices_height as f32 - 1.0),
+                );
+                positions.push(vec3(
+                    grid.top_left.x + grid.size.x * p.x,
+                    grid.top_left.y + grid.size.y * p.y,
+                    0.,
+                ));
                 texcoords.push(vec2(
                     grid.uv_min.x + (grid.uv_max.x - grid.uv_min.x) * p.x,
                     grid.uv_min.y + (grid.uv_max.y - grid.uv_min.y) * p.y,
@@ -57,18 +64,16 @@ impl From<&GridMesh> for Mesh {
                 }
             }
         }
-        let mut mesh = Mesh {
-            name: format!("Grid {}x{}", grid.n_vertices_height, grid.n_vertices_height),
-            positions: Some(positions),
+        let tangents = generate_tangents(&positions, &texcoords, &normals, &indices);
+
+        let mesh_builder = MeshBuilder {
+            positions,
             texcoords: vec![texcoords],
-            colors: None,
-            normals: Some(normals),
-            tangents: None,
-            indices: Some(indices),
-            joint_weights: None,
-            joint_indices: None,
+            normals,
+            tangents,
+            indices,
+            ..MeshBuilder::default()
         };
-        mesh.create_tangents();
-        mesh
+        mesh_builder.build().expect("Invalid grid mesh")
     }
 }

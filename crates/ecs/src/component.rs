@@ -6,7 +6,6 @@ use std::{
     marker::PhantomData,
 };
 
-use downcast_rs::Downcast;
 use parking_lot::MappedRwLockReadGuard;
 use serde::{
     self,
@@ -15,19 +14,38 @@ use serde::{
 };
 
 use crate::{
-    component_traits::IComponentBuffer, with_component_registry, AttributeGuard, AttributeStoreGuard, AttributeStoreGuardMut,
-    ComponentAttribute, ComponentEntry, ComponentPath, ComponentVTable, Debuggable, Description, Name, Serializable,
+    component_traits::IComponentBuffer, with_component_registry, AttributeGuard,
+    AttributeStoreGuard, AttributeStoreGuardMut, ComponentAttribute, ComponentEntry, ComponentPath,
+    ComponentVTable, Debuggable, Description, Name, Serializable,
 };
 
-pub trait ComponentValueBase: Send + Sync + Downcast + 'static {
-    fn type_name(&self) -> &'static str {
-        std::any::type_name::<Self>()
-    }
-}
+use ambient_shared_types::ComponentIndex;
+
+pub trait ComponentValueBase: Send + Sync + as_any::AsAny {}
 
 impl<T: Send + Sync + 'static> ComponentValueBase for T {}
 pub trait ComponentValue: ComponentValueBase + Clone {}
 impl<T: ComponentValueBase + Clone> ComponentValue for T {}
+
+/// Implemented for component values that can be used as an enum
+pub trait EnumComponent: Clone + Send + Sync {
+    fn to_u32(&self) -> u32;
+    fn from_u32(v: u32) -> Option<Self>
+    where
+        Self: Sized;
+}
+impl EnumComponent for u32 {
+    fn to_u32(&self) -> u32 {
+        *self
+    }
+
+    fn from_u32(v: u32) -> Option<Self>
+    where
+        Self: Sized,
+    {
+        Some(v)
+    }
+}
 
 /// Component key
 pub struct Component<T: 'static> {
@@ -59,13 +77,19 @@ impl<T: 'static> std::ops::Deref for Component<T> {
 
 impl<T> Debug for Component<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Component").field("path", &self.path()).field("index", &self.desc.index).finish()
+        f.debug_struct("Component")
+            .field("path", &self.path())
+            .field("index", &self.desc.index)
+            .finish()
     }
 }
 
 impl Debug for ComponentDesc {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ComponentDesc").field("path", &self.path()).field("index", &self.index).finish_non_exhaustive()
+        f.debug_struct("ComponentDesc")
+            .field("path", &self.path())
+            .field("index", &self.index)
+            .finish_non_exhaustive()
     }
 }
 
@@ -79,7 +103,7 @@ impl<T: 'static> Component<T> {
 
 impl<T> Clone for Component<T> {
     fn clone(&self) -> Self {
-        Self { desc: self.desc, _marker: PhantomData }
+        *self
     }
 }
 
@@ -107,7 +131,7 @@ impl<T> PartialEq<Component<T>> for ComponentDesc {
 
 impl<T> PartialOrd for Component<T> {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        self.desc.index.partial_cmp(&other.desc.index)
+        Some(self.cmp(other))
     }
 }
 
@@ -136,7 +160,10 @@ impl<T> Component<T> {
                 std::any::type_name::<T>()
             );
         }
-        Self { desc, _marker: PhantomData }
+        Self {
+            desc,
+            _marker: PhantomData,
+        }
     }
 
     pub fn as_debug<'a>(&self, value: &'a T) -> &'a dyn Debug {
@@ -148,7 +175,7 @@ impl<T> Component<T> {
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct ComponentDesc {
-    index: u32,
+    index: ComponentIndex,
     pub(crate) vtable: &'static ComponentVTable<()>,
 }
 
@@ -168,7 +195,7 @@ impl PartialEq for ComponentDesc {
 
 impl PartialOrd for ComponentDesc {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        self.index.partial_cmp(&other.index)
+        Some(self.cmp(other))
     }
 }
 impl Ord for ComponentDesc {
@@ -183,7 +210,10 @@ impl ComponentDesc {
         if let Some(path) = self.vtable.path {
             path.to_string()
         } else {
-            self.attribute::<ComponentPath>().expect("No path for component").0.clone()
+            self.attribute::<ComponentPath>()
+                .expect("No path for component")
+                .0
+                .clone()
         }
     }
 
@@ -192,7 +222,10 @@ impl ComponentDesc {
         if let Some(path) = self.vtable.path {
             path.rsplit_once("::").map(|v| v.1).unwrap_or(path).into()
         } else {
-            let path = &self.attribute::<ComponentPath>().expect("No path for component").0;
+            let path = &self
+                .attribute::<ComponentPath>()
+                .expect("No path for component")
+                .0;
             path.rsplit_once("::").map(|v| v.1).unwrap_or(path).into()
         }
     }
@@ -221,7 +254,7 @@ impl ComponentDesc {
         (self.vtable.get_type_id)() == TypeId::of::<T>()
     }
 
-    pub(crate) fn new(index: u32, vtable: &'static ComponentVTable<()>) -> Self {
+    pub(crate) fn new(index: ComponentIndex, vtable: &'static ComponentVTable<()>) -> Self {
         Self { index, vtable }
     }
 
@@ -257,7 +290,7 @@ impl ComponentDesc {
         }
     }
 
-    pub fn index(&self) -> u32 {
+    pub fn index(&self) -> ComponentIndex {
         self.index
     }
 
@@ -270,7 +303,11 @@ impl ComponentDesc {
 
     /// Converts the **value** to json
     pub fn to_json(&self, value: &ComponentEntry) -> Result<String, serde_json::Error> {
-        serde_json::to_string(self.attribute::<Serializable>().expect("Component is not serializable").serialize(value))
+        serde_json::to_string(
+            self.attribute::<Serializable>()
+                .expect("Component is not serializable")
+                .serialize(value),
+        )
     }
 
     pub fn create_buffer(&self) -> Box<dyn IComponentBuffer> {
@@ -347,8 +384,7 @@ macro_rules! components {
 
                     static ATTRIBUTES: $crate::OnceCell<$crate::parking_lot::RwLock<$crate::AttributeStore>> = $crate::OnceCell::new();
 
-                    static PATH: &str = concat!("core::", $ns, "::", stringify!($name));
-
+                    static PATH: &str = concat!("ambient_core::", $ns, "::", stringify!($name));
                     static VTABLE: &$crate::ComponentVTable<$ty> = &$crate::ComponentVTable::construct(
                         PATH,
                         |desc| $crate::parking_lot::RwLockReadGuard::map(ATTRIBUTES.get_or_init(|| init_attr($crate::Component::new(desc))).read(), |v| v),
@@ -363,8 +399,9 @@ macro_rules! components {
                 $(#[$outer])*
                 pub fn $name() -> $crate::Component<$ty> {
 
-                    let desc = *[<comp_ $name>].get()
-                        .expect(concat!("Component: ", "core::", $ns, "::", stringify!($name), " is not initialized"));
+                    let desc = *[<comp_ $name>].get().unwrap_or_else(|| {
+                        panic!("Component {} is not initialized", concat!("ambient_core::", $ns, "::", stringify!($name)))
+                    });
 
                     $crate::Component::new(desc)
                 }
@@ -405,10 +442,13 @@ mod test {
             |_| RwLockWriteGuard::map(ATTRIBUTES.write(), |v| v),
         );
 
-        let component: Component<String> = Component::new(ComponentDesc::new(1, unsafe { VTABLE.erase() }));
+        let component: Component<String> =
+            Component::new(ComponentDesc::new(1, unsafe { VTABLE.erase() }));
 
         let value = ComponentEntry::new(component, "Hello, World".into());
 
+        // Clone is for purpose of comparison
+        #[allow(clippy::redundant_clone)]
         let value2 = value.clone();
 
         let s = value.downcast_ref::<String>();
@@ -417,7 +457,10 @@ mod test {
         // Since they are cloned, they should not be reference equal
         assert!(!ptr::eq(s as *const String, s2 as *const String));
         // They are however value equal
-        assert_eq!(value.downcast_ref::<String>(), value2.downcast_ref::<String>());
+        assert_eq!(
+            value.downcast_ref::<String>(),
+            value2.downcast_ref::<String>()
+        );
 
         assert_eq!(value.try_downcast_ref::<&str>(), None);
     }
@@ -446,16 +489,25 @@ mod test {
 
         assert!(component.has_attribute::<Serializable>());
 
-        let p = Person { name: "Adam".into(), age: 28 };
+        let p = Person {
+            name: "Adam".into(),
+            age: 28,
+        };
         let entry = ComponentEntry::new(person(), p);
 
-        let str = serde_json::to_string_pretty(entry.attribute::<Serializable>().unwrap().serialize(&entry)).unwrap();
+        let str = serde_json::to_string_pretty(
+            entry.attribute::<Serializable>().unwrap().serialize(&entry),
+        )
+        .unwrap();
 
         eprintln!("Serialized: {str}");
 
         let ser = person().attribute::<Serializable>().unwrap();
 
-        let value: ComponentEntry = ser.deserializer(person().desc()).deserialize(&mut serde_json::Deserializer::from_str(&str)).unwrap();
+        let value: ComponentEntry = ser
+            .deserializer(person().desc())
+            .deserialize(&mut serde_json::Deserializer::from_str(&str))
+            .unwrap();
 
         eprintln!("Value: {:?}", value.as_debug());
 
@@ -467,7 +519,10 @@ mod test {
     #[test]
     fn make_default() {
         fn default_person() -> Person {
-            Person { age: 21, name: "unnamed".into() }
+            Person {
+                age: 21,
+                name: "unnamed".into(),
+            }
         }
 
         components! ("make_default", {
@@ -481,17 +536,37 @@ mod test {
         let people_desc: ComponentDesc = people().desc();
         let person_desc: ComponentDesc = person().desc();
 
-        let mut people = people_desc.attribute::<MakeDefault>().unwrap().make_default(people_desc);
+        let mut people = people_desc
+            .attribute::<MakeDefault>()
+            .unwrap()
+            .make_default(people_desc);
 
-        let mut person = person_desc.attribute::<MakeDefault>().unwrap().make_default(person_desc);
+        let mut person = person_desc
+            .attribute::<MakeDefault>()
+            .unwrap()
+            .make_default(person_desc);
 
-        assert_eq!(person.downcast_ref::<Person>(), &Person { age: 21, name: "unnamed".into() });
+        assert_eq!(
+            person.downcast_ref::<Person>(),
+            &Person {
+                age: 21,
+                name: "unnamed".into()
+            }
+        );
 
-        people.downcast_mut::<Vec<Person>>().push(person.downcast_cloned::<Person>());
+        people
+            .downcast_mut::<Vec<Person>>()
+            .push(person.downcast_cloned::<Person>());
 
-        assert_eq!(&people.downcast_mut::<Vec<Person>>()[0], person.downcast_ref::<Person>());
+        assert_eq!(
+            &people.downcast_mut::<Vec<Person>>()[0],
+            person.downcast_ref::<Person>()
+        );
         person.downcast_mut::<Person>().name = "Smith".to_string();
-        assert_ne!(&people.downcast_mut::<Vec<Person>>()[0], person.downcast_ref::<Person>());
+        assert_ne!(
+            &people.downcast_mut::<Vec<Person>>()[0],
+            person.downcast_ref::<Person>()
+        );
 
         eprintln!("people: {people:?}, person: {person:?}");
     }
@@ -541,6 +616,7 @@ mod test {
             drop(value);
             assert_eq!(Arc::strong_count(&shared), 2);
 
+            #[allow(clippy::redundant_clone)]
             let value3 = value2.clone();
             let value4: Arc<String> = value2.downcast_cloned();
             assert_eq!(Arc::strong_count(&shared), 4);
@@ -550,10 +626,19 @@ mod test {
             assert_eq!(value3.downcast_ref::<Arc<String>>(), &shared);
             assert_eq!(value3.downcast_ref::<Arc<String>>(), value2.downcast_ref());
 
-            assert!(!ptr::eq(value3.downcast_ref::<Arc<String>>() as *const Arc<String>, &shared as *const _));
-            assert!(!ptr::eq(value3.downcast_ref::<Arc<String>>() as *const Arc<String>, value2.downcast_ref::<Arc<String>>() as *const _));
+            assert!(!ptr::eq(
+                value3.downcast_ref::<Arc<String>>() as *const Arc<String>,
+                &shared as *const _
+            ));
+            assert!(!ptr::eq(
+                value3.downcast_ref::<Arc<String>>() as *const Arc<String>,
+                value2.downcast_ref::<Arc<String>>() as *const _
+            ));
 
-            assert!(ptr::eq(&**value3.downcast_ref::<Arc<String>>() as *const String, &*shared as *const _));
+            assert!(ptr::eq(
+                &**value3.downcast_ref::<Arc<String>>() as *const String,
+                &*shared as *const _
+            ));
         }
 
         assert_eq!(Arc::strong_count(&shared), 1);

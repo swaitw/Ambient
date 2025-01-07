@@ -1,21 +1,25 @@
 use ambient_core::{
     bounding::world_bounding_sphere,
     camera::{fovy, get_active_camera},
-    gpu_components,
-    gpu_ecs::{ComponentToGpuSystem, GpuComponentFormat, GpuWorldSyncEvent},
     hierarchy::children,
     main_scene,
     player::local_user_id,
     transform::translation,
 };
 use ambient_ecs::{components, query, ECSError, EntityId, Networked, Store, SystemGroup, World};
+use ambient_gpu_ecs::{
+    gpu_components, ComponentToGpuSystem, GpuComponentFormat, GpuWorldSyncEvent,
+};
 use bytemuck::{Pod, Zeroable};
 use glam::Vec3;
 use serde::{Deserialize, Serialize};
 
 use crate::primitives;
+use ambient_gpu::gpu::Gpu;
+use std::sync::Arc;
 
-const MAX_LOD_LEVELS: usize = 16;
+/// Maximum number of LOD levels
+pub const MAX_LOD_LEVELS: usize = 16;
 #[repr(transparent)]
 /// Represents clip space size cutoffs for the lod levels.
 ///
@@ -24,7 +28,7 @@ const MAX_LOD_LEVELS: usize = 16;
 pub struct LodCutoffs([f32; MAX_LOD_LEVELS]);
 
 impl LodCutoffs {
-    /// Construct lod levels, truncates and logs if `lods` exceed [`MAX_LOG_LEVELS`]
+    /// Construct lod levels, truncates and logs if `lods` exceed [`MAX_LOD_LEVELS`]
     pub fn new(lods: &[f32]) -> Self {
         let mut val = [0.0; MAX_LOD_LEVELS];
         if lods.len() > MAX_LOD_LEVELS {
@@ -62,61 +66,94 @@ gpu_components! {
 pub fn lod_system() -> SystemGroup {
     SystemGroup::new(
         "lod",
-        vec![query((lod_cutoffs(), cpu_lod(), world_bounding_sphere())).to_system(|q, world, qs, _| {
-            if let Some(main_camera) = get_active_camera(world, main_scene(), world.resource_opt(local_user_id())) {
-                let camera_pos = world.get(main_camera, translation()).unwrap_or(Vec3::ZERO);
-                let main_camera_fov = match world.get(main_camera, fovy()) {
-                    Ok(val) => val,
-                    Err(_) => return,
-                };
-                let main_camera_cot_fov_2 = 1. / (main_camera_fov / 2.).tan();
+        vec![
+            query((lod_cutoffs(), cpu_lod(), world_bounding_sphere())).to_system(
+                |q, world, qs, _| {
+                    if let Some(main_camera) =
+                        get_active_camera(world, main_scene(), world.resource_opt(local_user_id()))
+                    {
+                        let camera_pos =
+                            world.get(main_camera, translation()).unwrap_or(Vec3::ZERO);
+                        let main_camera_fov = match world.get(main_camera, fovy()) {
+                            Ok(val) => val,
+                            Err(_) => return,
+                        };
+                        let main_camera_cot_fov_2 = 1. / (main_camera_fov / 2.).tan();
 
-                // let frame = world.resource(frame_index());
-                // let count = q.query.iter(world, None).count();
-                // let chunk_size = (count / 100).max(1);
-                // let chunks = ((count as f32 / chunk_size as f32).ceil() as usize).max(1);
-                // let start = (frame % chunks) * chunk_size;
+                        // let frame = world.resource(frame_index());
+                        // let count = q.query.iter(world, None).count();
+                        // let chunk_size = (count / 100).max(1);
+                        // let chunks = ((count as f32 / chunk_size as f32).ceil() as usize).max(1);
+                        // let start = (frame % chunks) * chunk_size;
 
-                let mut to_update = Vec::new();
-                for (id, (lod_cutoffs, &current_lod, bounding_sphere)) in q.iter(world, qs) {
-                    let dist = (camera_pos - bounding_sphere.center).length();
-                    let clip_space_radius = bounding_sphere.radius * main_camera_cot_fov_2 / dist;
+                        let mut to_update = Vec::new();
+                        for (id, (lod_cutoffs, &current_lod, bounding_sphere)) in q.iter(world, qs)
+                        {
+                            let dist = (camera_pos - bounding_sphere.center).length();
+                            let clip_space_radius =
+                                bounding_sphere.radius * main_camera_cot_fov_2 / dist;
 
-                    let l = lod_cutoffs.0.iter().position(|x| clip_space_radius >= *x).unwrap_or(lod_cutoffs.0.len());
-                    if l != current_lod {
-                        to_update.push((id, l, current_lod));
-                    }
-                }
-                for (id, l, current_lod) in to_update {
-                    world.set(id, cpu_lod(), l).unwrap();
-                    if world.has_component(id, cpu_lod_group()) {
-                        if let Ok(children) = world.get_ref(id, children()).map(|x| x.clone()) {
-                            if current_lod < children.len() {
-                                set_lod_visible_recursive(world, children[current_lod], false).unwrap();
+                            let l = lod_cutoffs
+                                .0
+                                .iter()
+                                .position(|x| clip_space_radius >= *x)
+                                .unwrap_or(lod_cutoffs.0.len());
+                            if l != current_lod {
+                                to_update.push((id, l, current_lod));
                             }
-                            if l < children.len() {
-                                set_lod_visible_recursive(world, children[l], true).unwrap();
+                        }
+                        for (id, l, current_lod) in to_update {
+                            world.set(id, cpu_lod(), l).unwrap();
+                            if world.has_component(id, cpu_lod_group()) {
+                                if let Ok(children) =
+                                    world.get_ref(id, children()).map(|x| x.clone())
+                                {
+                                    if current_lod < children.len() {
+                                        set_lod_visible_recursive(
+                                            world,
+                                            children[current_lod],
+                                            false,
+                                        )
+                                        .unwrap();
+                                    }
+                                    if l < children.len() {
+                                        set_lod_visible_recursive(world, children[l], true)
+                                            .unwrap();
+                                    }
+                                }
                             }
                         }
                     }
-                }
-            }
-        })],
+                },
+            ),
+        ],
     )
 }
 
-pub fn gpu_world_system() -> SystemGroup<GpuWorldSyncEvent> {
+pub fn gpu_world_system(gpu: Arc<Gpu>) -> SystemGroup<GpuWorldSyncEvent> {
     SystemGroup::new(
         "lod/gpu_world",
-        vec![Box::new(ComponentToGpuSystem::new(GpuComponentFormat::Mat4, lod_cutoffs(), gpu_components::lod_cutoffs()))],
+        vec![Box::new(ComponentToGpuSystem::new(
+            gpu,
+            GpuComponentFormat::Mat4,
+            lod_cutoffs(),
+            gpu_components::lod_cutoffs(),
+        ))],
     )
 }
 
-pub fn set_lod_visible_recursive(world: &mut World, id: EntityId, value: bool) -> Result<(), ECSError> {
+pub fn set_lod_visible_recursive(
+    world: &mut World,
+    id: EntityId,
+    value: bool,
+) -> Result<(), ECSError> {
     if world.has_component(id, primitives()) {
         world.set(id, cpu_lod_visible(), value)?;
     }
-    let cs = world.get_ref(id, children()).map(|cs| cs.clone()).unwrap_or_default();
+    let cs = world
+        .get_ref(id, children())
+        .map(|cs| cs.clone())
+        .unwrap_or_default();
     for c in cs {
         set_lod_visible_recursive(world, c, value)?;
     }

@@ -1,22 +1,25 @@
 use std::sync::Arc;
 
-use ambient_core::asset_cache;
+use ambient_core::{asset_cache, FIXED_SERVER_TICK_TIME};
 use ambient_ecs::{
-    components, query, Debuggable, Description, DynSystem, Entity, EntityId, FnSystem, Name, Networked, Resource, Store, SystemGroup, World,
+    components, query, Debuggable, DynSystem, Entity, EntityId, FnSystem, Resource, SystemGroup,
+    World,
 };
+use ambient_native_std::asset_cache::{AssetCache, SyncAssetKey, SyncAssetKeyExt};
 use ambient_network::server::{ForkingEvent, ShutdownEvent};
-use ambient_std::asset_cache::{AssetCache, SyncAssetKey, SyncAssetKeyExt};
 use collider::{collider_shapes, collider_shapes_convex};
 use glam::{vec3, Mat4, Vec3};
 use helpers::release_px_scene;
 use parking_lot::Mutex;
 use physx::{
-    actor_aggregate, articulation_cache, articulation_link, articulation_reduce_coordinate, character_controller, fixed_joint,
-    physics_shape, revolute_joint, rigid_actor, rigid_dynamic, rigid_static,
+    actor_aggregate, articulation_cache, articulation_link, articulation_reduce_coordinate,
+    character_controller, fixed_joint, physics_shape, revolute_joint, rigid_actor, rigid_dynamic,
+    rigid_static,
 };
 use physxx::{
-    AsPxActor, PxContactPairHeader, PxControllerManagerRef, PxMaterial, PxPvdSceneFlag, PxRigidActor, PxRigidActorRef, PxSceneDesc,
-    PxSceneFlags, PxSceneRef, PxSimulationEventCallback, PxUserData,
+    AsPxActor, PxContactPairHeader, PxContactPoint, PxControllerManagerRef, PxMaterial,
+    PxPvdSceneFlag, PxRigidActor, PxSceneDesc, PxSceneFlags, PxSceneRef, PxSimulationEventCallback,
+    PxUserData,
 };
 use serde::{Deserialize, Serialize};
 
@@ -30,6 +33,8 @@ pub mod physx;
 pub mod rc_asset;
 pub mod visualization;
 
+pub use ambient_ecs::generated::physics::components::*;
+
 components!("physics", {
     @[Resource]
     main_physics_scene: PxSceneRef,
@@ -42,38 +47,7 @@ components!("physics", {
     @[Resource]
     wood_physics_material: PxMaterial,
     @[Debuggable, Resource]
-    collisions: Arc<Mutex<Vec<(PxRigidActorRef, PxRigidActorRef)>>>,
-
-    @[
-        Debuggable, Networked, Store,
-        Name["Unit velocity"],
-        Description["The velocity of a character/unit."]
-    ]
-    unit_velocity: Vec3,
-    @[
-        Debuggable, Networked, Store,
-        Name["Unit mass"],
-        Description["The mass of a character/unit."]
-    ]
-    unit_mass: f32,
-    @[
-        Debuggable, Networked, Store,
-        Name["Unit yaw"],
-        Description["The yaw of a character/unit."]
-    ]
-    unit_yaw: f32,
-    @[
-        Debuggable, Networked, Store, Resource,
-        Name["Collider loads"],
-        Description["Contains all colliders that were loaded in this physics tick."]
-    ]
-    collider_loads: Vec<EntityId>,
-    @[
-        Debuggable, Networked, Store, Resource,
-        Name["Make physics static"],
-        Description["All physics objects will be made static when loaded."]
-    ]
-    make_physics_static: bool,
+    collisions: Arc<Mutex<Vec<(EntityId, EntityId, Vec<Vec3>, Vec<Vec3>)>>>,
 });
 pub fn init_all_components() {
     init_components();
@@ -96,11 +70,32 @@ pub fn create_server_resources(assets: &AssetCache, server_resources: &mut Entit
     {
         let collisions = collisions.clone();
         main_scene_desc.set_simulation_event_callbacks(PxSimulationEventCallback {
-            collision_callback: Some(Box::new(move |header: &PxContactPairHeader| {
-                if let (Some(a), Some(b)) = (header.actors[0], header.actors[1]) {
-                    collisions.lock().push((a, b));
-                }
-            })),
+            collision_callback: Some(Box::new(
+                move |header: &PxContactPairHeader, contacts: Vec<PxContactPoint>| {
+                    if let (Some(a), Some(b)) = (header.actors[0], header.actors[1]) {
+                        let a = a
+                            .borrow_shapes()
+                            .get(0)
+                            .and_then(|s| s.get_user_data::<PxShapeUserData>())
+                            .map(|ud| ud.entity);
+                        let b = b
+                            .borrow_shapes()
+                            .get(0)
+                            .and_then(|s| s.get_user_data::<PxShapeUserData>())
+                            .map(|ud| ud.entity);
+
+                        let positions: Vec<Vec3> =
+                            contacts.iter().map(|point| point.position).collect();
+
+                        let normals: Vec<Vec3> =
+                            contacts.iter().map(|point| point.normal).collect();
+
+                        if let (Some(a), Some(b)) = (a, b) {
+                            collisions.lock().push((a, b, positions, normals));
+                        }
+                    }
+                },
+            )),
         });
     }
     let main_scene = PxSceneRef::new(&physics.physics, &main_scene_desc);
@@ -108,7 +103,9 @@ pub fn create_server_resources(assets: &AssetCache, server_resources: &mut Entit
     server_resources.set(self::collider_loads(), vec![]);
 
     main_scene.get_scene_pvd_client().set_scene_pvd_flags(
-        PxPvdSceneFlag::TRANSMIT_CONSTRAINTS | PxPvdSceneFlag::TRANSMIT_SCENEQUERIES | PxPvdSceneFlag::TRANSMIT_CONTACTS,
+        PxPvdSceneFlag::TRANSMIT_CONSTRAINTS
+            | PxPvdSceneFlag::TRANSMIT_SCENEQUERIES
+            | PxPvdSceneFlag::TRANSMIT_CONTACTS,
     );
 
     let main_controller_manager = PxControllerManagerRef::new(&main_scene, true);
@@ -125,7 +122,10 @@ pub fn create_server_resources(assets: &AssetCache, server_resources: &mut Entit
     server_resources.set(crate::picking_scene(), picking_scene);
     server_resources.set(crate::trigger_areas_scene(), trigger_areas);
     server_resources.set(self::main_controller_manager(), main_controller_manager);
-    server_resources.set(self::wood_physics_material(), PxMaterial::new(physics.physics, 0.5, 0.5, 0.6));
+    server_resources.set(
+        self::wood_physics_material(),
+        PxMaterial::new(physics.physics, 0.5, 0.5, 0.6),
+    );
 }
 
 #[derive(Debug, Clone)]
@@ -138,7 +138,11 @@ pub struct PxShapeUserData {
 
 impl Default for PxShapeUserData {
     fn default() -> Self {
-        Self { entity: EntityId::null(), density: 1.0, base_pose: Mat4::IDENTITY }
+        Self {
+            entity: EntityId::null(),
+            density: 1.0,
+            base_pose: Mat4::IDENTITY,
+        }
     }
 }
 
@@ -187,12 +191,15 @@ impl SyncAssetKey<PxMaterial> for PxWoodMaterialKey {
     }
 }
 
-unsafe extern "C" fn main_physx_scene_filter_shader(mut info: *mut physxx::sys::FilterShaderCallbackInfo) -> u16 {
+unsafe extern "C" fn main_physx_scene_filter_shader(
+    info: *mut physxx::sys::FilterShaderCallbackInfo,
+) -> u16 {
     (*(*info).pairFlags).mBits |= (physxx::sys::PxPairFlag::eSOLVE_CONTACT
         | physxx::sys::PxPairFlag::eDETECT_DISCRETE_CONTACT
         | physxx::sys::PxPairFlag::eDETECT_CCD_CONTACT
         | physxx::sys::PxPairFlag::eCONTACT_DEFAULT
-        | physxx::sys::PxPairFlag::eNOTIFY_TOUCH_FOUND) as u16;
+        | physxx::sys::PxPairFlag::eNOTIFY_TOUCH_FOUND
+        | physxx::sys::PxPairFlag::eNOTIFY_CONTACT_POINTS) as u16;
     (physxx::sys::PxFilterFlag::eDEFAULT) as u16
 }
 
@@ -200,36 +207,36 @@ pub fn server_systems() -> SystemGroup {
     SystemGroup::new(
         "physics",
         vec![
-            query((physics_shape(),)).despawned().to_system(|q, world, qs, _| {
-                for (id, (shape,)) in q.iter(world, qs) {
-                    if let Some(actor) = shape.get_actor() {
-                        actor.detach_shape(shape, true);
-                        for shape in actor.get_shapes() {
-                            let ud = shape.get_user_data::<PxShapeUserData>().unwrap();
-                            if ud.entity == id {
-                                actor.detach_shape(&shape, true);
+            query((physics_shape(),))
+                .despawned()
+                .to_system(|q, world, qs, _| {
+                    for (id, (shape,)) in q.iter(world, qs) {
+                        if let Some(actor) = shape.get_actor() {
+                            actor.detach_shape(shape, true);
+                            for shape in actor.get_shapes() {
+                                let ud = shape.get_user_data::<PxShapeUserData>().unwrap();
+                                if ud.entity == id {
+                                    actor.detach_shape(&shape, true);
+                                }
+                            }
+                            if actor.get_nb_shapes() == 0 {
+                                actor.as_actor().remove_user_data::<PxActorUserData>();
+                                actor.release();
                             }
                         }
-                        if actor.get_nb_shapes() == 0 {
-                            actor.as_actor().remove_user_data::<PxActorUserData>();
-                            actor.release();
-                        }
                     }
-                }
-            }),
-            query((character_controller(),)).despawned().to_system(|q, world, qs, _| {
-                for (_, (controller,)) in q.iter(world, qs) {
-                    controller.release();
-                }
-            }),
+                }),
+            query((character_controller(),))
+                .despawned()
+                .to_system(|q, world, qs, _| {
+                    for (_, (controller,)) in q.iter(world, qs) {
+                        controller.release();
+                    }
+                }),
             Box::new(collider::server_systems()),
             Box::new(visualization::server_systems()),
         ],
     )
-}
-
-pub fn client_systems() -> SystemGroup {
-    SystemGroup::new("physics", vec![Box::new(visualization::client_systems())])
 }
 
 /// Starts the physx simulation step concurrently.
@@ -239,7 +246,7 @@ pub fn run_simulation_system() -> DynSystem {
     Box::new(FnSystem::new(|world, _| {
         profiling::scope!("run_simulation_system");
         let scene = world.resource(main_physics_scene());
-        scene.simulate(1. / 60.);
+        scene.simulate(FIXED_SERVER_TICK_TIME.as_secs_f32());
     }))
 }
 
@@ -266,7 +273,10 @@ pub fn on_forking_systems() -> SystemGroup<ForkingEvent> {
             create_server_resources(world.resource(asset_cache()), &mut ed);
             world.add_components(world.resource_entity(), ed).unwrap();
 
-            for (id, _) in query(()).incl(actor_aggregate()).collect_cloned(world, None) {
+            for (id, _) in query(())
+                .incl(actor_aggregate())
+                .collect_cloned(world, None)
+            {
                 world.remove_component(id, actor_aggregate()).unwrap();
             }
             for (id, _) in query(()).incl(rigid_actor()).collect_cloned(world, None) {
@@ -287,23 +297,45 @@ pub fn on_forking_systems() -> SystemGroup<ForkingEvent> {
             for (id, _) in query(()).incl(revolute_joint()).collect_cloned(world, None) {
                 world.remove_component(id, revolute_joint()).unwrap();
             }
-            for (id, _) in query(()).incl(articulation_reduce_coordinate()).collect_cloned(world, None) {
-                world.remove_component(id, articulation_reduce_coordinate()).unwrap();
+            for (id, _) in query(())
+                .incl(articulation_reduce_coordinate())
+                .collect_cloned(world, None)
+            {
+                world
+                    .remove_component(id, articulation_reduce_coordinate())
+                    .unwrap();
             }
-            for (id, _) in query(()).incl(articulation_link()).collect_cloned(world, None) {
+            for (id, _) in query(())
+                .incl(articulation_link())
+                .collect_cloned(world, None)
+            {
                 world.remove_component(id, articulation_link()).unwrap();
             }
-            for (id, _) in query(()).incl(articulation_cache()).collect_cloned(world, None) {
+            for (id, _) in query(())
+                .incl(articulation_cache())
+                .collect_cloned(world, None)
+            {
                 world.remove_component(id, articulation_cache()).unwrap();
             }
-            for (id, _) in query(()).incl(character_controller()).collect_cloned(world, None) {
+            for (id, _) in query(())
+                .incl(character_controller())
+                .collect_cloned(world, None)
+            {
                 world.remove_component(id, character_controller()).unwrap();
             }
-            for (id, _) in query(()).incl(collider_shapes()).collect_cloned(world, None) {
+            for (id, _) in query(())
+                .incl(collider_shapes())
+                .collect_cloned(world, None)
+            {
                 world.remove_component(id, collider_shapes()).unwrap();
             }
-            for (id, _) in query(()).incl(collider_shapes_convex()).collect_cloned(world, None) {
-                world.remove_component(id, collider_shapes_convex()).unwrap();
+            for (id, _) in query(())
+                .incl(collider_shapes_convex())
+                .collect_cloned(world, None)
+            {
+                world
+                    .remove_component(id, collider_shapes_convex())
+                    .unwrap();
             }
         }))],
     )

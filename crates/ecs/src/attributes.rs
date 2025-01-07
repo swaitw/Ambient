@@ -1,23 +1,17 @@
 use std::{
-    any::{type_name, Any, TypeId},
+    any::{Any, TypeId},
     collections::HashMap,
     fmt::Debug,
     sync::Arc,
 };
 
-use downcast_rs::{impl_downcast, Downcast};
+use as_any::{AsAny, Downcast};
 use serde::{Deserialize, Serialize};
 
-use crate::{ComponentDesc, ComponentEntry, ComponentValue};
+use crate::{ComponentDesc, ComponentEntry, ComponentValue, EnumComponent};
 
 /// Represents a single attribute attached to a component
-pub trait ComponentAttribute: 'static + Send + Sync + Downcast {
-    fn type_name(&self) -> &'static str {
-        type_name::<Self>()
-    }
-}
-
-impl_downcast!(ComponentAttribute);
+pub trait ComponentAttribute: 'static + Send + Sync + AsAny {}
 
 #[derive(Default, Clone)]
 pub struct AttributeStore {
@@ -26,7 +20,9 @@ pub struct AttributeStore {
 
 impl AttributeStore {
     pub fn new() -> Self {
-        Self { inner: Default::default() }
+        Self {
+            inner: Default::default(),
+        }
     }
 
     pub fn set<A: ComponentAttribute>(&mut self, attribute: A) {
@@ -42,7 +38,9 @@ impl AttributeStore {
     }
 
     pub fn get<A: ComponentAttribute>(&self) -> Option<&A> {
-        self.inner.get(&TypeId::of::<A>()).map(|v| v.downcast_ref::<A>().expect("Invalid type"))
+        self.inner
+            .get(&TypeId::of::<A>())
+            .map(|v| (**v).downcast_ref::<A>().expect("Invalid type"))
     }
 
     pub fn has<A: ComponentAttribute>(&self) -> bool {
@@ -51,7 +49,8 @@ impl AttributeStore {
 
     /// Appends all attributes from `other` into self by cloning
     pub fn append(&mut self, other: &Self) {
-        self.inner.extend(other.inner.iter().map(|(&k, v)| (k, v.clone())))
+        self.inner
+            .extend(other.inner.iter().map(|(&k, v)| (k, v.clone())))
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (TypeId, &Arc<dyn ComponentAttribute>)> {
@@ -72,7 +71,9 @@ impl Debug for AttributeStore {
 
 impl FromIterator<Arc<dyn ComponentAttribute>> for AttributeStore {
     fn from_iter<T: IntoIterator<Item = Arc<dyn ComponentAttribute>>>(iter: T) -> Self {
-        Self { inner: iter.into_iter().map(|v| ((*v).type_id(), v)).collect() }
+        Self {
+            inner: iter.into_iter().map(|v| ((*v).type_id(), v)).collect(),
+        }
     }
 }
 
@@ -88,7 +89,10 @@ pub trait AttributeConstructor<T, P>: 'static + Send + Sync {
 /// Prefer [`Store`] or [`Networked`] rather than using directly
 pub struct Serializable {
     ser: fn(&ComponentEntry) -> &dyn erased_serde::Serialize,
-    deser: fn(ComponentDesc, &mut dyn erased_serde::Deserializer) -> Result<ComponentEntry, erased_serde::Error>,
+    deser: fn(
+        ComponentDesc,
+        &mut dyn erased_serde::Deserializer,
+    ) -> Result<ComponentEntry, erased_serde::Error>,
 }
 impl ComponentAttribute for Serializable {}
 impl<T> AttributeConstructor<T, ()> for Serializable
@@ -97,7 +101,7 @@ where
 {
     fn construct(store: &mut AttributeStore, _: ()) {
         store.set(Self {
-            ser: |v| v.downcast_ref::<T>() as &dyn erased_serde::Serialize,
+            ser: |v| (*v).downcast_ref::<T>() as &dyn erased_serde::Serialize,
             deser: |desc, deserializer| {
                 let value = T::deserialize(deserializer)?;
                 let entry = ComponentEntry::from_raw_parts(desc, value);
@@ -114,13 +118,19 @@ impl Serializable {
 
     /// Deserialize a value
     pub fn deserializer(&self, desc: ComponentDesc) -> ComponentDeserializer {
-        ComponentDeserializer { desc, deser: self.deser }
+        ComponentDeserializer {
+            desc,
+            deser: self.deser,
+        }
     }
 }
 
 pub struct ComponentDeserializer {
     desc: ComponentDesc,
-    deser: fn(ComponentDesc, &mut dyn erased_serde::Deserializer) -> Result<ComponentEntry, erased_serde::Error>,
+    deser: fn(
+        ComponentDesc,
+        &mut dyn erased_serde::Deserializer,
+    ) -> Result<ComponentEntry, erased_serde::Error>,
 }
 
 impl<'de> serde::de::DeserializeSeed<'de> for ComponentDeserializer {
@@ -150,7 +160,9 @@ where
     T: 'static + Debug,
 {
     fn construct(store: &mut AttributeStore, _: ()) {
-        store.set(Self { debug: |entry| entry.downcast_ref::<T>().unwrap() as &dyn Debug })
+        store.set(Self {
+            debug: |entry| (*entry).downcast_ref::<T>().unwrap() as &dyn Debug,
+        })
     }
 }
 
@@ -168,12 +180,18 @@ impl MakeDefault {
 }
 impl<T: ComponentValue + Default> AttributeConstructor<T, ()> for MakeDefault {
     fn construct(store: &mut AttributeStore, _: ()) {
-        store.set(Self { make_default: Arc::new(move |desc| ComponentEntry::from_raw_parts(desc, T::default())) })
+        store.set(Self {
+            make_default: Arc::new(move |desc| ComponentEntry::from_raw_parts(desc, T::default())),
+        })
     }
 }
-impl<T: ComponentValue, F: 'static + Send + Sync + Fn() -> T> AttributeConstructor<T, F> for MakeDefault {
+impl<T: ComponentValue, F: 'static + Send + Sync + Fn() -> T> AttributeConstructor<T, F>
+    for MakeDefault
+{
     fn construct(store: &mut AttributeStore, func: F) {
-        store.set(Self { make_default: Arc::new(move |desc| ComponentEntry::from_raw_parts(desc, func())) })
+        store.set(Self {
+            make_default: Arc::new(move |desc| ComponentEntry::from_raw_parts(desc, func())),
+        })
     }
 }
 
@@ -272,5 +290,23 @@ impl ComponentAttribute for MaybeResource {}
 impl<T: ComponentValue> AttributeConstructor<T, ()> for MaybeResource {
     fn construct(store: &mut AttributeStore, _: ()) {
         store.set(Self)
+    }
+}
+
+/// This component can be converted to/from a U32.
+pub struct Enum {
+    pub to_u32: fn(&dyn Any) -> u32,
+    pub from_u32: fn(ComponentDesc, u32) -> Option<ComponentEntry>,
+}
+impl ComponentAttribute for Enum {}
+impl<T> AttributeConstructor<T, ()> for Enum
+where
+    T: 'static + EnumComponent,
+{
+    fn construct(store: &mut AttributeStore, _: ()) {
+        store.set(Self {
+            to_u32: |entry| (*entry).downcast_ref::<T>().unwrap().to_u32(),
+            from_u32: |desc, value| Some(ComponentEntry::from_raw_parts(desc, T::from_u32(value)?)),
+        })
     }
 }

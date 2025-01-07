@@ -1,50 +1,30 @@
-use std::{any::TypeId, collections::HashMap};
+use std::{any::TypeId, collections::HashMap, time::Duration};
 
-use glam::{Mat4, Quat, UVec2, UVec3, UVec4, Vec2, Vec3, Vec4};
+use glam::{IVec2, IVec3, IVec4, Mat4, Quat, UVec2, UVec3, UVec4, Vec2, Vec3, Vec4};
 use once_cell::sync::Lazy;
 use paste::paste;
 
 use crate::{
-    AttributeConstructor, AttributeStore, ComponentDesc, ComponentRegistry, ComponentVTable, Description, EntityId,
-    ExternalComponentAttributes, Name,
+    AttributeConstructor, AttributeStore, ComponentDesc, ComponentRegistry, ComponentVTable,
+    Description, EntityId, ExternalComponentAttributes, Name,
 };
 
-/// A mapping from enum names to Rust types. Instantiate this with a macro that takes `$(($value:ident, $type:ty)),*`.
-#[macro_export]
-macro_rules! primitive_component_definitions {
-    ($macro_to_instantiate:ident) => {
-        $macro_to_instantiate!(
-            (Empty, ()),
-            (Bool, bool),
-            (EntityId, EntityId),
-            (F32, f32),
-            (F64, f64),
-            (Mat4, Mat4),
-            (I32, i32),
-            (Quat, Quat),
-            (String, String),
-            (U32, u32),
-            (U64, u64),
-            (Vec2, Vec2),
-            (Vec3, Vec3),
-            (Vec4, Vec4),
-            (Uvec2, UVec2),
-            (Uvec3, UVec3),
-            (Uvec4, UVec4)
-        );
-    };
-}
+use ambient_shared_types::primitive_component_definitions;
+use ambient_shared_types::{
+    ProceduralMaterialHandle, ProceduralMeshHandle, ProceduralSamplerHandle,
+    ProceduralTextureHandle,
+};
 
 // implementation
 macro_rules! build_attribute_registration {
-    ($type:ty, $store:ident, $attributes:ident) => {{
-        if let Some(name) = $attributes.name {
+    ($type:ty, $store:ident, $name:ident, $description:ident, $attributes:ident) => {{
+        if let Some(name) = $name {
             <Name as AttributeConstructor<$type, _>>::construct(&mut $store, &name);
         }
-        if let Some(description) = $attributes.description {
+        if let Some(description) = $description {
             <Description as AttributeConstructor<$type, _>>::construct(&mut $store, &description);
         }
-        $attributes.flags.construct_for_store::<$type>(&mut $store);
+        $attributes.construct_for_store::<$type>(&mut $store);
 
         static VTABLE: &ComponentVTable<$type> = &ComponentVTable::construct_external();
         unsafe { VTABLE.erase() }
@@ -132,18 +112,18 @@ macro_rules! make_primitive_component {
                     }
                 }
 
-                pub(crate) fn register(&self, reg: &mut ComponentRegistry, path: &str, attributes: ExternalComponentAttributes) {
+                pub(crate) fn register(&self, reg: &mut ComponentRegistry, path: &str, name: Option<&str>, description: Option<&str>, attributes: ExternalComponentAttributes) {
                     let mut store = AttributeStore::new();
                     let vtable = match self {
                         $(
                             PrimitiveComponentType::$value => {
-                                build_attribute_registration!($type, store, attributes)
+                                build_attribute_registration!($type, store, name, description, attributes)
                             },
                             PrimitiveComponentType::[< Vec $value >] => {
-                                build_attribute_registration!(Vec<$type>, store, attributes)
+                                build_attribute_registration!(Vec<$type>, store, name, description, attributes)
                             },
                             PrimitiveComponentType::[< Option $value >] => {
-                                build_attribute_registration!(Option<$type>, store, attributes)
+                                build_attribute_registration!(Option<$type>, store, name, description, attributes)
                             },
                         )*
                     };

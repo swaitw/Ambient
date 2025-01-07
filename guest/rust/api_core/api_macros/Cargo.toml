@@ -1,0 +1,17 @@
+[package]
+name = "ambient_api_macros"
+version = { workspace = true }
+rust-version = { workspace = true }
+edition = "2021"
+description = "Macros for the Ambient API"
+license = "MIT OR Apache-2.0"
+documentation = "https://docs.rs/ambient_api_macros"
+repository = "https://github.com/AmbientRun/Ambient"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+quote = "1.0"
+proc-macro2 = "1.0"
+syn = { version = "1.0", features = ["full"] }

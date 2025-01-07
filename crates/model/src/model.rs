@@ -6,22 +6,28 @@ use ambient_core::{
     hierarchy::{children, parent},
     main_scene, name,
     transform::{
-        fbx_complex_transform, fbx_post_rotation, fbx_pre_rotation, fbx_rotation_offset, fbx_rotation_pivot, fbx_scaling_offset,
-        fbx_scaling_pivot, inv_local_to_world, local_to_parent, local_to_world, mesh_to_local, mesh_to_world, rotation, scale, translation,
+        fbx_complex_transform, fbx_post_rotation, fbx_pre_rotation, fbx_rotation_offset,
+        fbx_rotation_pivot, fbx_scaling_offset, fbx_scaling_pivot, inv_local_to_world,
+        local_to_parent, local_to_world, mesh_to_local, mesh_to_world, rotation, scale,
+        translation,
     },
 };
-use ambient_ecs::{query, ComponentDesc, Entity, EntityId, World};
-use ambient_renderer::{
-    cast_shadows, color, gpu_primitives,
-    lod::cpu_lod_visible,
-    primitives,
-    skinning::{self, Skin, SkinsBuffer, SkinsBufferKey},
+use ambient_ecs::{
+    generated::{animation::components::bind_id, hierarchy::components::unmanaged_children},
+    query, ComponentDesc, Entity, EntityId, World,
 };
-use ambient_std::{
+use ambient_gpu::gpu::Gpu;
+use ambient_native_std::{
     asset_cache::{AssetCache, AsyncAssetKeyExt, SyncAssetKeyExt},
     asset_url::AbsAssetUrl,
     download_asset::AssetError,
     shapes::AABB,
+};
+use ambient_renderer::{
+    cast_shadows, color, gpu_primitives_lod, gpu_primitives_mesh,
+    lod::cpu_lod_visible,
+    primitives,
+    skinning::{self, Skin, SkinsBuffer, SkinsBufferKey},
 };
 use futures::future::join_all;
 use glam::{Mat4, Vec3, Vec4};
@@ -29,7 +35,7 @@ use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 
 use super::{
-    animation_bind_id, animation_binder, is_model_node, model_animatable, model_loaded, model_skin_ix, model_skins,
+    animation_binder, is_model_node, model_animatable, model_loaded, model_skin_ix, model_skins,
     pbr_renderer_primitives_from_url,
 };
 
@@ -75,16 +81,27 @@ impl Model {
     pub fn from_slice(content: &[u8]) -> anyhow::Result<Self> {
         Ok(Self(World::from_slice(content)?))
     }
-    pub async fn load(&mut self, assets: &AssetCache, model_url: &AbsAssetUrl) -> anyhow::Result<()> {
+    pub async fn load(
+        &mut self,
+        assets: &AssetCache,
+        model_url: &AbsAssetUrl,
+    ) -> anyhow::Result<()> {
         for (id, prims) in query(pbr_renderer_primitives_from_url()).collect_cloned(&self.0, None) {
-            self.0.remove_component(id, pbr_renderer_primitives_from_url()).unwrap();
-            let prims = join_all(prims.into_iter().map(|prim| async move { prim.resolve(model_url)?.get(assets).await }).collect_vec())
-                .await
-                .into_iter()
-                .collect::<Result<Vec<_>, AssetError>>()?
-                .into_iter()
-                .map(|x| (*x).clone())
-                .collect_vec();
+            self.0
+                .remove_component(id, pbr_renderer_primitives_from_url())
+                .unwrap();
+            let prims = join_all(
+                prims
+                    .into_iter()
+                    .map(|prim| async move { prim.resolve(model_url)?.get(assets).await })
+                    .collect_vec(),
+            )
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, AssetError>>()?
+            .into_iter()
+            .map(|x| (*x).clone())
+            .collect_vec();
             self.0.add_component(id, primitives(), prims).unwrap();
         }
         Ok(())
@@ -111,11 +128,21 @@ impl Model {
         self.0.resource_opt(model_skins())
     }
 
-    pub fn spawn(&self, world: &mut World, opts: &ModelSpawnOpts) -> EntityId {
-        self.batch_spawn(world, opts, 1).pop().unwrap()
+    pub fn spawn(&self, gpu: &Gpu, world: &mut World, opts: &ModelSpawnOpts) -> EntityId {
+        self.batch_spawn(gpu, world, opts, 1).pop().unwrap()
     }
-    pub fn batch_spawn(&self, world: &mut World, opts: &ModelSpawnOpts, count: usize) -> Vec<EntityId> {
-        let mut root_components = opts.root_components.clone().with(main_scene(), ()).with_default(model_loaded());
+    pub fn batch_spawn(
+        &self,
+        gpu: &Gpu,
+        world: &mut World,
+        opts: &ModelSpawnOpts,
+        count: usize,
+    ) -> Vec<EntityId> {
+        let mut root_components = opts
+            .root_components
+            .clone()
+            .with(main_scene(), ())
+            .with(model_loaded(), ());
         if let Some(aabb) = self.aabb() {
             root_components = root_components
                 .with(local_bounding_aabb(), aabb)
@@ -124,7 +151,9 @@ impl Model {
         }
 
         // See README.md
-        let animatable = opts.animatable.unwrap_or(self.animatable().unwrap_or(self.0.len() > 2));
+        let animatable = opts
+            .animatable
+            .unwrap_or(self.animatable().unwrap_or(self.0.len() > 2));
         let spawn_as_scene = animatable || self.0.len() > 2;
 
         if spawn_as_scene {
@@ -150,7 +179,10 @@ impl Model {
                             root_components.remove_self(name());
                         }
 
-                        tracing::info!("Attaching to {:?} to {entity}", root_components.get(local_bounding_aabb()));
+                        tracing::debug!(
+                            "Attaching to {:?} to {entity}",
+                            root_components.get(local_bounding_aabb())
+                        );
 
                         world.add_components(*entity, root_components).unwrap();
                     }
@@ -160,7 +192,12 @@ impl Model {
                     if let Some(name_) = self.name() {
                         root_components.set(name(), name_.clone());
                     }
-                    world.batch_spawn(root_components.with(children(), vec![]).with_default(local_to_world()), count)
+                    world.batch_spawn(
+                        root_components
+                            .with(children(), vec![])
+                            .with(local_to_world(), Default::default()),
+                        count,
+                    )
                 }
             };
 
@@ -170,13 +207,18 @@ impl Model {
                         .with(parent(), EntityId::null())
                         .with(children(), vec![])
                         .with(local_to_parent(), transform)
-                        .with_default(local_to_world())
-                        .with_default(is_model_node()),
+                        .with(local_to_world(), Default::default())
+                        .with(is_model_node(), ())
+                        .with(unmanaged_children(), ()),
                     count,
                 );
                 for (transform, root) in transform_roots.iter().zip(roots.iter()) {
                     world.set(*transform, parent(), *root).unwrap();
-                    world.set(*root, children(), vec![*transform]).unwrap();
+                    if let Ok(childs) = world.get_mut(*root, children()) {
+                        childs.push(*transform);
+                    } else {
+                        world.set(*root, children(), vec![*transform]).unwrap();
+                    }
                 }
                 transform_roots
             } else {
@@ -185,6 +227,7 @@ impl Model {
 
             for node_id in &self.roots() {
                 let childs = self.spawn_subtree(
+                    gpu,
                     world,
                     *node_id,
                     transform_roots.clone(),
@@ -218,16 +261,27 @@ impl Model {
                 for (root, entity_lookups) in roots.iter().zip(entity_lookups.into_iter()) {
                     let anim_binds = entity_lookups
                         .into_iter()
-                        .filter_map(|(id, entity)| (self.0.get_ref(id, animation_bind_id()).ok().map(|bid| (bid.clone(), entity))))
+                        .filter_map(|(id, entity)| {
+                            self.0
+                                .get_ref(id, bind_id())
+                                .ok()
+                                .map(|bid| (bid.clone(), entity))
+                        })
                         .collect();
-                    world.add_component(*root, animation_binder(), anim_binds).unwrap();
+                    world
+                        .add_component(*root, animation_binder(), anim_binds)
+                        .unwrap();
                 }
             }
 
             roots
         } else {
             let root_node = self.roots()[0];
-            let root_ed = self.create_entity_data(root_node, opts, Some(self.get_transform().unwrap_or(Mat4::IDENTITY)));
+            let root_ed = self.create_entity_data(
+                root_node,
+                opts,
+                Some(self.get_transform().unwrap_or(Mat4::IDENTITY)),
+            );
             root_components.merge(root_ed);
             match &opts.root {
                 ModelSpawnRoot::AttachTo(entities) => {
@@ -258,7 +312,10 @@ impl Model {
                     if let Some(name_) = self.name() {
                         root_components.set(name(), name_.clone());
                     }
-                    world.batch_spawn(root_components.with(local_to_world(), glam::Mat4::IDENTITY), count)
+                    world.batch_spawn(
+                        root_components.with(local_to_world(), glam::Mat4::IDENTITY),
+                        count,
+                    )
                 }
             }
         }
@@ -266,6 +323,7 @@ impl Model {
     #[allow(clippy::too_many_arguments)]
     fn spawn_subtree(
         &self,
+        gpu: &Gpu,
         world: &mut World,
         id: EntityId,
         parent_ids: Vec<EntityId>,
@@ -278,13 +336,16 @@ impl Model {
         let mut ed = self
             .create_entity_data(id, opts, None)
             .with(parent(), EntityId::null())
-            .with_default(is_model_node())
+            .with(is_model_node(), ())
             .with(local_to_parent(), Mat4::IDENTITY);
 
         if let Some(skin_ix) = ed.remove_self(model_skin_ix()) {
             let skin = self.skins().unwrap()[skin_ix].clone();
             let count = skin.inverse_bind_matrices.len();
-            ed.set(skinning::inverse_bind_matrices(), skin.inverse_bind_matrices.clone());
+            ed.set(
+                skinning::inverse_bind_matrices(),
+                skin.inverse_bind_matrices.clone(),
+            );
             ed.set(skinning::joints(), skin.joints);
             ed.set(skinning::joint_matrices(), vec![Mat4::IDENTITY; count]);
             ed.set(skinning::skin(), Skin::null());
@@ -298,7 +359,7 @@ impl Model {
         if let Ok(skin_ix) = self.0.get(id, model_skin_ix()) {
             let skin = self.skins().unwrap()[skin_ix].clone();
             for entity in &entities {
-                let skin_buffer = skins_buffer.create(skin.inverse_bind_matrices.len() as u32);
+                let skin_buffer = skins_buffer.create(gpu, skin.inverse_bind_matrices.len() as u32);
                 world.set(*entity, skinning::skin(), skin_buffer).unwrap();
             }
         }
@@ -316,15 +377,36 @@ impl Model {
             }
         }
         if self.0.has_component(id, children()) {
+            for id in &entities {
+                world.add_component(*id, unmanaged_children(), ()).ok();
+            }
             for c in self.0.get_ref(id, children()).unwrap().iter() {
-                self.spawn_subtree(world, *c, entities.clone(), root_ids.clone(), entity_lookups, skins_buffer, opts, count);
+                self.spawn_subtree(
+                    gpu,
+                    world,
+                    *c,
+                    entities.clone(),
+                    root_ids.clone(),
+                    entity_lookups,
+                    skins_buffer,
+                    opts,
+                    count,
+                );
             }
         }
         entities
     }
 
     pub fn transform(&mut self, transform: Mat4) {
-        self.0.add_resource(local_to_parent(), transform * self.0.resource_opt(local_to_parent()).cloned().unwrap_or_default());
+        self.0.add_resource(
+            local_to_parent(),
+            transform
+                * self
+                    .0
+                    .resource_opt(local_to_parent())
+                    .cloned()
+                    .unwrap_or_default(),
+        );
     }
     pub fn rotate_yup_to_zup(&mut self) {
         self.transform(Mat4::from_cols(Vec4::X, Vec4::Z, Vec4::Y, Vec4::W));
@@ -336,19 +418,29 @@ impl Model {
         }
     }
     pub fn get_entity_id_by_name(&self, node_name: &str) -> Option<EntityId> {
-        query(name()).iter(&self.0, None).find_map(|x| if x.1 == node_name { Some(x.0) } else { None })
+        query(name())
+            .iter(&self.0, None)
+            .find_map(|x| if x.1 == node_name { Some(x.0) } else { None })
     }
-    pub fn get_entity_id_by_bind_id(&self, bind_id: &str) -> Option<EntityId> {
-        query(animation_bind_id()).iter(&self.0, None).find_map(|x| if x.1 == bind_id { Some(x.0) } else { None })
+    pub fn get_entity_id_by_bind_id(&self, bid: &str) -> Option<EntityId> {
+        query(bind_id())
+            .iter(&self.0, None)
+            .find_map(|x| if x.1 == bid { Some(x.0) } else { None })
     }
     /// Remove matrices that doesn't need to be there for when the model is stored on disk
     pub fn remove_non_storage_matrices(&mut self) {
-        for (id, _) in query(()).incl(local_to_world()).collect_cloned(&self.0, None) {
+        for (id, _) in query(())
+            .incl(local_to_world())
+            .collect_cloned(&self.0, None)
+        {
             if id != self.0.resource_entity() {
                 self.0.remove_component(id, local_to_world()).unwrap();
             }
         }
-        for (id, _) in query(()).incl(local_to_parent()).collect_cloned(&self.0, None) {
+        for (id, _) in query(())
+            .incl(local_to_parent())
+            .collect_cloned(&self.0, None)
+        {
             if id != self.0.resource_entity() {
                 self.0.remove_component(id, local_to_parent()).unwrap();
             }
@@ -365,29 +457,30 @@ impl Model {
                 aabb.transform(&mesh_to_model).to_aabb()
             })
             .collect_vec();
-        self.0.add_resource(local_bounding_aabb(), AABB::unions(&aabbs).unwrap_or(AABB::ZERO));
+        self.0.add_resource(
+            local_bounding_aabb(),
+            AABB::unions(&aabbs).unwrap_or(AABB::ZERO),
+        );
+    }
+    /// Builds the base pose of this model
+    pub fn build_base_pose(&self) -> HashMap<String, Entity> {
+        query(bind_id())
+            .iter(&self.0, None)
+            .map(|(id, bind_id)| {
+                let mut ed = Entity::new();
+                self.build_transform(id, &mut ed, None, true);
+                (bind_id.clone(), ed)
+            })
+            .collect()
     }
 
-    /// Applies the base pose of this model to the loaded model in  the world
-    pub fn apply_base_pose(&self, world: &mut World, id: EntityId) {
-        if let Ok(bindings) = world.get_ref(id, animation_binder()).cloned() {
-            for (node, bind_id) in query(animation_bind_id()).iter(&self.0, None) {
-                if let Some(target) = bindings.get(bind_id) {
-                    self.apply_transform_to_entity(node, world, *target, true);
-                }
-            }
-        }
-    }
-
-    fn apply_transform_to_entity(&self, source_entity: EntityId, world: &mut World, id: EntityId, rotation_only: bool) {
-        let mut ed = Entity::new();
-        let mut remove = Vec::new();
-        self.build_transform(source_entity, &mut ed, Some(&mut remove), rotation_only);
-        world.remove_components(id, remove).ok();
-        world.add_components(id, ed).ok();
-    }
-
-    fn build_transform(&self, node: EntityId, ed: &mut Entity, mut remove: Option<&mut Vec<ComponentDesc>>, rotation_only: bool) {
+    fn build_transform(
+        &self,
+        node: EntityId,
+        ed: &mut Entity,
+        mut remove: Option<&mut Vec<ComponentDesc>>,
+        rotation_only: bool,
+    ) {
         if let Ok(rot) = self.0.get(node, rotation()) {
             ed.set(rotation(), rot);
         } else if let Some(remove) = &mut remove {
@@ -445,12 +538,22 @@ impl Model {
             }
         }
     }
-    fn create_entity_data(&self, node: EntityId, opts: &ModelSpawnOpts, single_mesh_transform: Option<Mat4>) -> Entity {
-        let mut ed = self.0.clone_entity(node).unwrap().with_default(local_to_world());
+    fn create_entity_data(
+        &self,
+        node: EntityId,
+        opts: &ModelSpawnOpts,
+        single_mesh_transform: Option<Mat4>,
+    ) -> Entity {
+        let mut ed = self
+            .0
+            .clone_entity(node)
+            .unwrap()
+            .with(local_to_world(), Default::default());
         if let Some(mat) = single_mesh_transform {
             ed.set(
                 mesh_to_local(),
-                mat * self.0.get(node, local_to_world()).unwrap_or_default() * self.0.get(node, mesh_to_local()).unwrap_or_default(),
+                mat * self.0.get(node, local_to_world()).unwrap_or_default()
+                    * self.0.get(node, mesh_to_local()).unwrap_or_default(),
             );
             if let Some(bounding) = ed.get_mut(local_bounding_aabb()) {
                 *bounding = bounding.transform(&mat).to_aabb();
@@ -463,7 +566,8 @@ impl Model {
         }
 
         if self.0.has_component(node, primitives()) {
-            ed.set(gpu_primitives(), Default::default());
+            ed.set(gpu_primitives_mesh(), Default::default());
+            ed.set(gpu_primitives_lod(), Default::default());
             if !ed.contains(color()) {
                 ed.set(color(), Vec4::ONE);
             }

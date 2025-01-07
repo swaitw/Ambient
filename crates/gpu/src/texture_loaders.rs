@@ -1,7 +1,7 @@
 use std::{borrow::Cow, fmt, io::Cursor, sync::Arc};
 
-use ambient_std::{
-    asset_cache::{AssetCache, AsyncAssetKey, AsyncAssetKeyExt},
+use ambient_native_std::{
+    asset_cache::{AssetCache, AsyncAssetKey, AsyncAssetKeyExt, SyncAssetKeyExt},
     asset_url::AbsAssetUrl,
     download_asset::{AssetError, AssetResult, BytesFromUrl},
     CowStr,
@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use futures::future::join_all;
 use image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
 
-use crate::texture::Texture;
+use crate::{gpu::GpuKey, texture::Texture};
 
 #[derive(Debug, Clone)]
 pub struct ImageFromUrl {
@@ -31,20 +31,28 @@ pub struct Rgba8ImageFromUrl {
 #[async_trait]
 impl AsyncAssetKey<Result<Arc<image::RgbaImage>, AssetError>> for Rgba8ImageFromUrl {
     async fn load(self, assets: AssetCache) -> Result<Arc<image::RgbaImage>, AssetError> {
-        image_from_url(assets, self.url).await.map(|x| Arc::new(x.into_rgba8()))
+        image_from_url(assets, self.url)
+            .await
+            .map(|x| Arc::new(x.into_rgba8()))
     }
 }
 
 async fn image_from_url(assets: AssetCache, url: AbsAssetUrl) -> Result<DynamicImage, AssetError> {
     let data = BytesFromUrl::new(url.clone(), true).get(&assets).await?;
 
-    let extension = url.extension().context("No extension")?;
-    Ok(task::block_in_place(move || -> anyhow::Result<DynamicImage> {
-        let format = ImageFormat::from_extension(extension).context("Invalid extension")?;
-        Ok(image::io::Reader::with_format(Cursor::new(&*data), format).decode()?)
-    })
-    .with_context(|| format!("Failed to load image {url}"))
-    .unwrap())
+    Ok(task::block_in_place({
+            let url = url.clone();
+            move || -> anyhow::Result<DynamicImage> {
+                if let Some(format) = url.extension().and_then(ImageFormat::from_extension) {
+                    Ok(image::io::Reader::with_format(Cursor::new(&*data), format).decode()?)
+                } else {
+                    Ok(image::io::Reader::new(Cursor::new(&*data))
+                        .with_guessed_format()
+                        .with_context(|| format!("Failed to guess format, and couldn't find an extension of image with URL \"{url}\""))?
+                        .decode()?)
+                }
+        }})
+        .with_context(|| format!("Failed to load image from \"{url}\""))?)
 }
 
 #[derive(Debug, Clone)]
@@ -59,8 +67,17 @@ impl AsyncAssetKey<Result<Arc<Texture>, AssetError>> for TextureFromUrl {
     }
     #[tracing::instrument(level = "info", name = "texture_from_url")]
     async fn load(self, assets: AssetCache) -> Result<Arc<Texture>, AssetError> {
+        let gpu = GpuKey.get(&assets);
         let image = image_from_url(assets.clone(), self.url.clone()).await?;
-        task::block_in_place(|| Ok(Arc::new(Texture::from_image_mipmapped(assets, image, self.format, Some(&self.url.to_string())))))
+        task::block_in_place(|| {
+            Ok(Arc::new(Texture::from_image_mipmapped(
+                &gpu,
+                &assets,
+                image,
+                self.format,
+                Some(&self.url.to_string()),
+            )))
+        })
     }
 }
 
@@ -75,9 +92,16 @@ impl AsyncAssetKey<Result<Arc<Texture>, AssetError>> for TextureFromRgba8Image {
         asset.as_ref().ok().map(|x| x.size_in_bytes)
     }
     async fn load(self, assets: AssetCache) -> Result<Arc<Texture>, AssetError> {
+        let gpu = GpuKey.get(&assets);
         let img = self.image.get(&assets).await?;
         task::block_in_place(|| {
-            Ok(Arc::new(Texture::from_rgba8_image_mipmapped(assets, &img, self.format, Some(&format!("{:?}", self.image)))))
+            Ok(Arc::new(Texture::from_rgba8_image_mipmapped(
+                &gpu,
+                &assets,
+                &img,
+                self.format,
+                Some(&format!("{:?}", self.image)),
+            )))
         })
     }
 }
@@ -90,7 +114,10 @@ pub struct TextureFromBytes {
 
 impl TextureFromBytes {
     pub fn new(bytes: impl Into<Cow<'static, [u8]>>, label: Option<impl Into<CowStr>>) -> Self {
-        Self { bytes: bytes.into(), label: label.map(Into::into) }
+        Self {
+            bytes: bytes.into(),
+            label: label.map(Into::into),
+        }
     }
 }
 
@@ -102,9 +129,17 @@ impl AsyncAssetKey<Result<Arc<Texture>, AssetError>> for TextureFromBytes {
         asset.as_ref().ok().map(|asset| asset.size_in_bytes)
     }
     async fn load(self, assets: AssetCache) -> Result<Arc<Texture>, AssetError> {
+        let gpu = GpuKey.get(&assets);
         let texture = task::spawn_blocking(move || -> anyhow::Result<Arc<Texture>> {
-            let image = image::load_from_memory(&self.bytes[..]).context("Failed to load image from bytes")?;
-            Ok(Arc::new(Texture::from_image_mipmapped(assets, image, wgpu::TextureFormat::Rgba8UnormSrgb, self.label.as_deref())))
+            let image = image::load_from_memory(&self.bytes[..])
+                .context("Failed to load image from bytes")?;
+            Ok(Arc::new(Texture::from_image_mipmapped(
+                &gpu,
+                &assets,
+                image,
+                wgpu::TextureFormat::Rgba8UnormSrgb,
+                self.label.as_deref(),
+            )))
         })
         .await
         .context("Failed to join")??;
@@ -126,7 +161,9 @@ impl AsyncAssetKey<Result<Arc<image::RgbaImage>, AssetError>> for Rgba8ImageInMe
 }
 impl std::fmt::Debug for Rgba8ImageInMemory {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Rgba8ImageInMemory").field("image_uid", &self.image_uid).finish()
+        f.debug_struct("Rgba8ImageInMemory")
+            .field("image_uid", &self.image_uid)
+            .finish()
     }
 }
 
@@ -163,6 +200,7 @@ impl AsyncAssetKey<Result<Arc<Texture>, AssetError>> for SplitTextureFromUrl {
         asset.as_ref().ok().map(|asset| asset.size_in_bytes)
     }
     async fn load(self, assets: AssetCache) -> Result<Arc<Texture>, AssetError> {
+        let gpu = GpuKey.get(&assets);
         let color = image_from_url(assets.clone(), self.color.clone()).await?;
         let alpha = image_from_url(assets.clone(), self.alpha.clone()).await?;
         task::block_in_place(|| {
@@ -172,7 +210,13 @@ impl AsyncAssetKey<Result<Arc<Texture>, AssetError>> for SplitTextureFromUrl {
                 color.0[3] = alpha.0[0];
             }
             let label = format!("color={} alpha={}", self.color, self.alpha);
-            Ok(Arc::new(Texture::from_image_mipmapped(assets, DynamicImage::ImageRgba8(color), self.format, Some(&label))))
+            Ok(Arc::new(Texture::from_image_mipmapped(
+                &gpu,
+                &assets,
+                DynamicImage::ImageRgba8(color),
+                self.format,
+                Some(&label),
+            )))
         })
     }
 }
@@ -188,11 +232,22 @@ impl AsyncAssetKey<Result<Arc<image::RgbaImage>, AssetError>> for Rgba8ImageCapp
         let image = self.image.get(&assets).await?;
         if image.width() > self.max_size || image.height() > self.max_size {
             let (width, height) = if image.width() >= image.height() {
-                (self.max_size, (self.max_size as f32 * image.height() as f32 / image.width() as f32) as u32)
+                (
+                    self.max_size,
+                    (self.max_size as f32 * image.height() as f32 / image.width() as f32) as u32,
+                )
             } else {
-                ((self.max_size as f32 * image.width() as f32 / image.height() as f32) as u32, self.max_size)
+                (
+                    (self.max_size as f32 * image.width() as f32 / image.height() as f32) as u32,
+                    self.max_size,
+                )
             };
-            Ok(Arc::new(image::imageops::resize(&*image as &image::RgbaImage, width, height, image::imageops::FilterType::CatmullRom)))
+            Ok(Arc::new(image::imageops::resize(
+                &*image as &image::RgbaImage,
+                width,
+                height,
+                image::imageops::FilterType::CatmullRom,
+            )))
         } else {
             Ok(image)
         }
@@ -213,7 +268,9 @@ where
     F: 'static,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("MappedTexture").field("inner", &format!("{:?}", std::any::TypeId::of::<F>())).finish()
+        f.debug_struct("MappedTexture")
+            .field("inner", &format!("{:?}", std::any::TypeId::of::<F>()))
+            .finish()
     }
 }
 
@@ -235,12 +292,16 @@ where
         asset.as_ref().ok().map(|asset| asset.size_in_bytes)
     }
     async fn load(self, assets: AssetCache) -> Result<Arc<Texture>, AssetError> {
-        let mut image = image_from_url(assets.clone(), self.inner.url.clone()).await?.into_rgba8();
+        let mut image = image_from_url(assets.clone(), self.inner.url.clone())
+            .await?
+            .into_rgba8();
         image.pixels_mut().for_each(|v| (*v = (self.func)(*v)));
 
+        let gpu = GpuKey.get(&assets);
         task::block_in_place(|| {
             Ok(Arc::new(Texture::from_image_mipmapped(
-                assets,
+                &gpu,
+                &assets,
                 DynamicImage::ImageRgba8(image),
                 self.inner.format,
                 Some(&self.inner.url.to_string()),
@@ -273,7 +334,7 @@ impl AsyncAssetKey<Result<Arc<Texture>, AssetError>> for TextureArrayFromUrls {
                                 .with_guessed_format()
                                 .with_context(|| format!("Failed to guess format of {url}"))?
                                 .decode()
-                                .with_context(|| format!("Failed to decode image {url}"))?
+                                .with_context(|| format!("Failed to decode image from {url}"))?
                                 .into_rgba8())
                         })
                     }
@@ -281,9 +342,18 @@ impl AsyncAssetKey<Result<Arc<Texture>, AssetError>> for TextureArrayFromUrls {
                 .collect::<Vec<_>>(),
         )
         .await;
+        let gpu = GpuKey.get(&assets);
         task::block_in_place(|| -> AssetResult<Arc<Texture>> {
-            let imgs = texs.into_iter().collect::<anyhow::Result<Vec<RgbaImage>>>()?;
-            Ok(Arc::new(Texture::array_rgba8_mipmapped(assets, self.label.as_ref().map(|x| x as &str), imgs, self.format)))
+            let imgs = texs
+                .into_iter()
+                .collect::<anyhow::Result<Vec<RgbaImage>>>()?;
+            Ok(Arc::new(Texture::array_rgba8_mipmapped(
+                &gpu,
+                &assets,
+                self.label.as_ref().map(|x| x as &str),
+                imgs,
+                self.format,
+            )))
         })
     }
 }

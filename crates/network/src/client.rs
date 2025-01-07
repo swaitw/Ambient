@@ -1,111 +1,156 @@
-use std::{
-    fmt::{Debug, Display},
-    net::SocketAddr,
-    sync::Arc,
-    time::Duration,
-};
-
-use ambient_app::window_title;
-use ambient_core::{
-    asset_cache, gpu,
-    player::{player, user_id},
-    runtime,
-    window::mirror_window_components,
-};
-use ambient_ecs::{components, query, world_events, Entity, EntityId, Resource, SystemGroup, World, WorldDiff, WorldEventReader};
-use ambient_element::{Element, ElementComponent, ElementComponentExt, Hooks};
+use ambient_core::{gpu, window::window_scale_factor};
+use ambient_ecs::{components, Resource, World};
+use ambient_element::{consume_context, element_component, Element, ElementComponentExt, Hooks};
+use ambient_native_std::{asset_cache::AssetCache, cb, friendly_id, to_byte_unit, Cb};
 use ambient_renderer::RenderTarget;
 use ambient_rpc::RpcRegistry;
-use ambient_std::{cb, fps_counter::FpsSample, log_result, to_byte_unit, CallbackFn, Cb};
-use ambient_ui::{Button, Centered, FlowColumn, FlowRow, Image, Text, Throbber};
-use anyhow::Context;
-use futures::{io::BufReader, AsyncBufReadExt, AsyncReadExt, Future, StreamExt};
+use ambient_sys::task::{PlatformBoxFuture, RuntimeHandle};
+use ambient_ui_native::{Image, MeasureSize};
+use as_any::AsAny;
+use bytes::Bytes;
+use futures::future::BoxFuture;
 use glam::UVec2;
 use parking_lot::Mutex;
-use quinn::{Connection, NewConnection};
 use serde::{de::DeserializeOwned, Serialize};
-
-use crate::{
-    client_game_state::ClientGameState,
-    create_client_endpoint_random_port,
-    events::event_registry,
-    is_remote_entity, log_network_result,
-    protocol::{ClientInfo, ClientProtocol},
-    rpc_request,
-    server::{ServerInfo, SharedServerState},
-    NetworkError,
+use std::{
+    collections::HashMap,
+    fmt::{Debug, Display},
+    future::Future,
+    sync::Arc,
 };
 
-components!("network", {
+use crate::{
+    client_game_state::ClientGameState, log_network_result, proto::client::SharedClientGameState,
+    server, NetworkError, RPC_BISTREAM_ID,
+};
+
+components!("network::client", {
     @[Resource]
-    game_client: Option<GameClient>,
+    client_state: Option<ClientState>,
+    @[Resource]
+    bi_stream_handlers: BiStreamHandlers,
+    @[Resource]
+    uni_stream_handlers: UniStreamHandlers,
+    @[Resource]
+    datagram_handlers: DatagramHandlers,
+    /// The most recent server performance statistics
+    @[Resource]
+    client_network_stats: NetworkStats,
 });
 
-pub fn get_player_entity(world: &World, target_user_id: &str) -> Option<EntityId> {
-    query((user_id(), player())).iter(world, None).find(|(_, (uid, _))| uid.as_str() == target_user_id).map(|kv| kv.0)
+#[cfg(not(target_os = "unknown"))]
+pub type PlatformSendStream = quinn::SendStream;
+#[cfg(not(target_os = "unknown"))]
+pub type PlatformRecvStream = quinn::RecvStream;
+
+#[cfg(target_os = "unknown")]
+pub type PlatformSendStream = crate::webtransport::SendStream;
+#[cfg(target_os = "unknown")]
+pub type PlatformRecvStream = crate::webtransport::RecvStream;
+
+type BiStreamHandler = Arc<
+    dyn Fn(
+            &mut World,
+            AssetCache,
+            PlatformSendStream,
+            PlatformRecvStream,
+        ) -> PlatformBoxFuture<'static, ()>
+        + Sync
+        + Send,
+>;
+type UniStreamHandler = Arc<
+    dyn Fn(&mut World, AssetCache, PlatformRecvStream) -> PlatformBoxFuture<'static, ()>
+        + Sync
+        + Send,
+>;
+type DatagramHandler = Arc<dyn Fn(&mut World, AssetCache, Bytes) + Sync + Send>;
+
+pub type BiStreamHandlers = HashMap<u32, (&'static str, BiStreamHandler)>;
+pub type UniStreamHandlers = HashMap<u32, (&'static str, UniStreamHandler)>;
+pub type DatagramHandlers = HashMap<u32, (&'static str, DatagramHandler)>;
+
+/// Represents either side of a high level connection to a game client of some sort.
+///
+/// Allows making requests and RPC, etc
+pub trait NetworkTransport: 'static + Send + Sync {
+    /// Performs a bidirectional request and waits for a response.
+    fn request_bi(&self, id: u32, data: Bytes) -> BoxFuture<Result<Bytes, NetworkError>>;
+    /// Performs a unidirectional request without waiting for a response.
+    fn request_uni(&self, id: u32, data: Bytes) -> BoxFuture<Result<(), NetworkError>>;
+    fn send_datagram(&self, id: u32, data: Bytes) -> BoxFuture<Result<(), NetworkError>>;
+}
+
+pub(crate) enum Control {
+    Disconnect,
 }
 
 #[derive(Clone)]
-pub struct GameRpcArgs {
-    pub state: SharedServerState,
+/// Manages the client side connection to the server.
+pub struct ClientState {
+    pub transport: Arc<dyn NetworkTransport>,
+    pub rpc_registry: Arc<RpcRegistry<server::RpcArgs>>,
     pub user_id: String,
+    pub game_state: SharedClientGameState,
+    pub uid: String,
 }
-impl GameRpcArgs {
-    pub fn get_player(&self, world: &World) -> Option<EntityId> {
-        get_player_entity(world, &self.user_id)
+
+impl Debug for ClientState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GameClient")
+            .field("connection", &self.transport.type_name())
+            .field("rpc_registry", &self.rpc_registry)
+            .field("user_id", &self.user_id)
+            .field("game_state", &self.game_state)
+            .field("uid", &self.uid)
+            .finish()
     }
 }
 
-#[derive(Debug, Clone)]
-/// Manages the client side connection to the server.
-pub struct GameClient {
-    pub connection: Connection,
-    pub rpc_registry: Arc<RpcRegistry<GameRpcArgs>>,
-    pub user_id: String,
-    pub game_state: Arc<Mutex<ClientGameState>>,
-}
-
-impl GameClient {
+impl ClientState {
     pub fn new(
-        connection: Connection,
-        rpc_registry: Arc<RpcRegistry<GameRpcArgs>>,
+        transport: Arc<dyn NetworkTransport>,
+        rpc_registry: Arc<RpcRegistry<server::RpcArgs>>,
         game_state: Arc<Mutex<ClientGameState>>,
         user_id: String,
     ) -> Self {
-        Self { connection, rpc_registry, user_id, game_state }
+        Self {
+            transport,
+            rpc_registry,
+            user_id,
+            game_state,
+            uid: friendly_id(),
+        }
     }
-
-    const SIZE_LIMIT: usize = 100_000_000;
 
     pub async fn rpc<
         Req: Serialize + DeserializeOwned + Send + 'static,
         Resp: Serialize + DeserializeOwned + Send,
-        F: Fn(GameRpcArgs, Req) -> L + Send + Sync + Copy + 'static,
+        F: Fn(server::RpcArgs, Req) -> L + Send + Sync + Copy + 'static,
         L: Future<Output = Resp> + Send,
     >(
         &self,
         func: F,
         req: Req,
     ) -> Result<Resp, NetworkError> {
-        rpc_request(&self.connection, self.rpc_registry.clone(), func, req, Self::SIZE_LIMIT).await
+        rpc_request(&*self.transport, self.rpc_registry.clone(), func, req).await
     }
 
     pub fn make_standalone_rpc_wrapper<
         Req: Serialize + DeserializeOwned + Send + 'static,
         Resp: Serialize + DeserializeOwned + Send,
-        F: Fn(GameRpcArgs, Req) -> L + Send + Sync + Copy + 'static,
+        F: Fn(server::RpcArgs, Req) -> L + Send + Sync + Copy + 'static,
         L: Future<Output = Resp> + Send,
     >(
         &self,
-        runtime: &tokio::runtime::Handle,
+        runtime: &RuntimeHandle,
         func: F,
     ) -> Cb<impl Fn(Req)> {
         let runtime = runtime.clone();
-        let (connection, rpc_registry) = (self.connection.clone(), self.rpc_registry.clone());
+        let (connection, rpc_registry) = (self.transport.clone(), self.rpc_registry.clone());
         cb(move |req| {
             let (connection, rpc_registry) = (connection.clone(), rpc_registry.clone());
             runtime.spawn(async move {
-                log_network_result!(rpc_request(&connection, rpc_registry, func, req, Self::SIZE_LIMIT).await);
+                log_network_result!(rpc_request(&*connection, rpc_registry, func, req).await);
             });
         })
     }
@@ -113,6 +158,26 @@ impl GameClient {
     pub fn with_physics_world<R>(&self, f: impl Fn(&mut World) -> R) -> R {
         f(&mut self.game_state.lock().world)
     }
+}
+
+async fn rpc_request<
+    Args: Send + 'static,
+    Req: Serialize + DeserializeOwned + Send + 'static,
+    Resp: Serialize + DeserializeOwned + Send,
+    F: Fn(Args, Req) -> L + Send + Sync + Copy + 'static,
+    L: Future<Output = Resp> + Send,
+>(
+    transport: &dyn NetworkTransport,
+    reg: Arc<RpcRegistry<Args>>,
+    func: F,
+    req: Req,
+) -> Result<Resp, NetworkError> {
+    let req = reg.serialize_req(func, req);
+
+    let resp = transport.request_bi(RPC_BISTREAM_ID, req.into()).await?;
+
+    let resp = reg.deserialize_resp(func, &resp)?;
+    Ok(resp)
 }
 
 #[derive(Debug, Clone)]
@@ -125,7 +190,9 @@ pub struct UseOnce<T> {
 
 impl<T> UseOnce<T> {
     pub fn new(val: T) -> Self {
-        Self { val: Mutex::new(Some(val)) }
+        Self {
+            val: Mutex::new(Some(val)),
+        }
     }
 
     pub fn take(&self) -> Option<T> {
@@ -133,344 +200,58 @@ impl<T> UseOnce<T> {
     }
 }
 
-pub type InitCallback = Box<dyn FnOnce(&mut World, Arc<RenderTarget>) + Send + Sync>;
+pub type CleanupFunc = Box<dyn FnOnce() + Send + Sync>;
+pub type LoadedFunc =
+    Cb<dyn Fn(&ClientState, &mut ClientGameState) -> anyhow::Result<CleanupFunc> + Send + Sync>;
 
-#[allow(clippy::type_complexity)]
-#[derive(Debug)]
-pub struct GameClientView {
-    pub server_addr: SocketAddr,
-    pub user_id: String,
-    pub resolution: UVec2,
-    pub systems_and_resources: Cb<dyn Fn() -> (SystemGroup, Entity) + Sync + Send>,
-    pub init_world: Cb<UseOnce<InitCallback>>,
-    pub error_view: Cb<dyn Fn(String) -> Element + Sync + Send>,
-    pub on_loaded: Cb<dyn Fn(Arc<Mutex<ClientGameState>>, GameClient) -> anyhow::Result<Box<dyn FnOnce() + Sync + Send>> + Sync + Send>,
-    pub on_in_entities: Option<Cb<dyn Fn(&WorldDiff) + Sync + Send>>,
-    pub on_disconnect: Cb<dyn Fn() + Sync + Send + 'static>,
-    pub create_rpc_registry: Cb<dyn Fn() -> RpcRegistry<GameRpcArgs> + Sync + Send>,
-    pub on_network_stats: Cb<dyn Fn(GameClientNetworkStats) + Sync + Send>,
-    pub on_server_stats: Cb<dyn Fn(GameClientServerStats) + Sync + Send>,
-    pub ui: Element,
-}
+#[element_component]
+pub fn GameClientWorld(hooks: &mut Hooks) -> Element {
+    let (render_target, set_render_target) =
+        consume_context::<GameClientRenderTarget>(hooks).unwrap();
 
-impl Clone for GameClientView {
-    fn clone(&self) -> Self {
-        Self {
-            server_addr: self.server_addr,
-            user_id: self.user_id.clone(),
-            resolution: self.resolution,
-            systems_and_resources: self.systems_and_resources.clone(),
-            init_world: self.init_world.clone(),
-            error_view: self.error_view.clone(),
-            on_loaded: self.on_loaded.clone(),
-            on_in_entities: self.on_in_entities.clone(),
-            on_disconnect: self.on_disconnect.clone(),
-            create_rpc_registry: self.create_rpc_registry.clone(),
-            on_network_stats: self.on_network_stats.clone(),
-            on_server_stats: self.on_server_stats.clone(),
-            ui: self.ui.clone(),
+    let gpu = hooks.world.resource(gpu()).clone();
+    let scale_factor = *hooks.world.resource(window_scale_factor());
+
+    MeasureSize::el(
+        Image {
+            texture: Some(Arc::new(
+                render_target
+                    .0
+                    .color_buffer
+                    .create_view(&Default::default()),
+            )),
         }
-    }
-}
-
-impl ElementComponent for GameClientView {
-    fn render(self: Box<Self>, hooks: &mut Hooks) -> Element {
-        let Self {
-            server_addr,
-            user_id,
-            resolution,
-            init_world,
-            error_view,
-            systems_and_resources,
-            create_rpc_registry,
-            on_loaded,
-            on_in_entities,
-            ui,
-            on_disconnect,
-            on_network_stats,
-            on_server_stats,
-        } = *self;
-
-        let gpu = hooks.world.resource(gpu()).clone();
-
-        let (render_target, set_render_target) = hooks.use_state_with(|_| Arc::new(RenderTarget::new(gpu.clone(), resolution, None)));
-
-        hooks.use_effect(resolution, |_, &resolution| {
-            if resolution.x > 0 && resolution.y > 0 {
-                set_render_target(Arc::new(RenderTarget::new(gpu.clone(), resolution, None)));
-            }
-
-            Box::new(|_| {})
-        });
-
-        let (connection_status, set_connection_status) = hooks.use_state("Connecting".to_string());
-
-        let assets = hooks.world.resource(asset_cache()).clone();
-        let game_state = hooks.use_ref_with(|world| {
-            let (systems, resources) = systems_and_resources();
-            let mut state = ClientGameState::new(world, assets.clone(), user_id.clone(), render_target.clone(), systems, resources);
-
-            (init_world.take().expect("Init called twice"))(&mut state.world, render_target.clone());
-
-            state
-        });
-
-        // The game client will be set once a connection establishes
-        let (game_client, set_game_client) = hooks.use_state(None as Option<GameClient>);
-
-        {
-            let game_state = game_state.clone();
-            let render_target = render_target.clone();
-            let world_event_reader = Mutex::new(hooks.world.resource(world_events()).reader());
-            hooks.use_frame(move |app_world| {
-                let mut game_state = game_state.lock();
-
-                mirror_window_components(app_world, &mut game_state.world);
-                // Pipe events from app world to game world
-                for (_, event) in world_event_reader.lock().iter(app_world.resource(world_events())) {
-                    game_state.world.resource_mut(world_events()).add_event(event.clone());
-                }
-
-                game_state.on_frame(&render_target);
-            });
-        }
-
-        // Set the window title to the project name
-        let (window_title_state, set_window_title) = hooks.use_state("Ambient".to_string());
-        *hooks.world.resource_mut(window_title()) = window_title_state;
-
-        let (error, set_error) = hooks.use_state(None);
-
-        let reg = game_state.lock().world.resource(event_registry()).clone();
-
-        let task = {
-            let runtime = hooks.world.resource(runtime()).clone();
-
-            hooks.use_memo_with((), move |_, ()| {
-                let task = runtime.spawn(async move {
-                    // These are the callbacks for everything that can happen
-                    let mut on_event = {
-                        let game_state = game_state.clone();
-                        let reg = reg.clone();
-                        move |event_name: String, event_data| {
-                            let event_name = event_name.trim();
-                            let res = reg.handle_event(&game_state, event_name, event_data);
-                            log_result!(res);
-                        }
-                    };
-
-                    let mut on_init = {
-                        let game_state = game_state.clone();
-                        move |conn, client_info: ClientInfo, server_info: ServerInfo| {
-                            let game_client =
-                                GameClient::new(conn, Arc::new(create_rpc_registry()), game_state.clone(), client_info.user_id);
-
-                            game_state.lock().world.add_resource(self::game_client(), Some(game_client.clone()));
-
-                            // Update parent client
-                            set_game_client(Some(game_client.clone()));
-                            // Update the window title
-                            set_window_title(server_info.project_name);
-                            on_loaded(game_state.clone(), game_client).context("Failed to initialize game client view")
-                        }
-                    };
-
-                    let mut on_diff = |diff| {
-                        if let Some(on_in_entities) = &on_in_entities {
-                            on_in_entities(&diff);
-                        }
-                        let mut gs = game_state.lock();
-                        diff.apply(&mut gs.world, Entity::new().with(is_remote_entity(), ()), false);
-                    };
-
-                    let mut on_server_stats = |stats| {
-                        on_server_stats(stats);
-                    };
-
-                    let mut on_network_stats = |stats| {
-                        on_network_stats(stats);
-                    };
-
-                    let client_loop = ClientInstance {
-                        set_connection_status,
-                        server_addr,
-                        user_id,
-                        on_init: &mut on_init,
-                        on_diff: &mut on_diff,
-                        on_server_stats: &mut on_server_stats,
-                        on_client_stats: &mut on_network_stats,
-                        on_event: &mut on_event,
-                        on_disconnect,
-                        init_destructor: None,
-                    };
-
-                    match client_loop.run().await {
-                        Err(err) => {
-                            if let Some(err) = err.downcast_ref::<NetworkError>() {
-                                if let NetworkError::ConnectionClosed = err {
-                                    log::info!("Connection closed by peer");
-                                } else {
-                                    log::error!("Network error: {:?}", err);
-                                }
-                            } else {
-                                log::error!("Game failed: {:?}", err);
-                            }
-                            set_error(Some(format!("{err:?}")));
-                        }
-                        Ok(()) => {
-                            log::info!("Client disconnected");
-                        }
-                    };
-                });
-                Arc::new(task)
-            })
-        };
-
-        // When the GameClientView is despawned, stop the task.
-        {
-            let task = task.clone();
-            hooks.use_spawn(move |_| Box::new(move |_| task.abort()));
-        }
-
-        if let Some(err) = error {
-            return error_view(err);
-        }
-
-        if let Some(game_client) = game_client {
-            // Provide the context
-            hooks.provide_context(|| game_client.clone());
-            hooks.provide_context(|| GameClientRenderTarget(render_target.clone()));
-            hooks.world.add_resource(self::game_client(), Some(game_client.clone()));
-
-            Image { texture: Some(Arc::new(render_target.color_buffer.create_view(&Default::default()))) }.el().children(vec![ui])
-        } else {
-            Centered(vec![FlowColumn::el([
-                FlowRow::el([Text::el(connection_status), Throbber.el()]),
-                Button::new("Cancel", move |_| task.abort()).el(),
-            ])])
-            .el()
-        }
-    }
-}
-
-struct ClientInstance<'a> {
-    set_connection_status: CallbackFn<String>,
-    server_addr: SocketAddr,
-    user_id: String,
-
-    /// Called when the client connected and received the world.
-    on_init: &'a mut (dyn FnMut(Connection, ClientInfo, ServerInfo) -> anyhow::Result<Box<dyn FnOnce() + Sync + Send>> + Send + Sync),
-    on_diff: &'a mut (dyn FnMut(WorldDiff) + Send + Sync),
-
-    on_server_stats: &'a mut (dyn FnMut(GameClientServerStats) + Send + Sync),
-    on_client_stats: &'a mut (dyn FnMut(GameClientNetworkStats) + Send + Sync),
-    on_event: &'a mut (dyn FnMut(String, Box<[u8]>) + Send + Sync),
-    on_disconnect: Cb<dyn Fn() + Sync + Send + 'static>,
-    init_destructor: Option<Box<dyn FnOnce() + Sync + Send>>,
-}
-
-impl<'a> Drop for ClientInstance<'a> {
-    fn drop(&mut self) {
-        (self.on_disconnect)();
-        if let Some(on_disconnect) = self.init_destructor.take() {
-            (on_disconnect)();
-        }
-    }
-}
-
-impl<'a> ClientInstance<'a> {
-    #[tracing::instrument(skip(self))]
-    async fn run(mut self) -> anyhow::Result<()> {
-        log::info!("Connecting to server at {}", self.server_addr);
-        (self.set_connection_status)(format!("Connecting to {}", self.server_addr));
-        let conn = open_connection(self.server_addr).await?;
-
-        (self.set_connection_status)("Waiting for server to respond".to_string());
-
-        // Set up the protocol.
-        let mut protocol = ClientProtocol::new(conn, self.user_id.clone()).await?;
-
-        let stats_interval = 5;
-        let mut stats_timer = tokio::time::interval(Duration::from_secs_f32(stats_interval as f32));
-        let mut prev_stats = protocol.connection().stats();
-
-        // The first WorldDiff initializes the world, so wait for that until we say things are "ready"
-        (self.set_connection_status)("Receiving world".to_string());
-
-        let msg = protocol.diff_stream.next().await?;
-        (self.on_diff)(msg);
-        self.init_destructor = Some(
-            (self.on_init)(protocol.connection(), protocol.client_info().clone(), protocol.server_info.clone())
-                .context("Client initialization failed")?,
-        );
-
-        // The server
-        loop {
-            tokio::select! {
-                msg = protocol.diff_stream.next() => {
-                    profiling::scope!("game_in_entities");
-                    let msg: WorldDiff  = msg?;
-                    (self.on_diff)(msg);
-                }
-                _ = stats_timer.tick() => {
-                    let stats = protocol.connection().stats();
-
-                    (self.on_client_stats)(GameClientNetworkStats {
-                        latency_ms: protocol.connection().rtt().as_millis() as u64,
-                        bytes_sent: (stats.udp_tx.bytes - prev_stats.udp_tx.bytes) / stats_interval,
-                        bytes_received: (stats.udp_rx.bytes - prev_stats.udp_rx.bytes) / stats_interval,
-                    });
-
-                    prev_stats = stats;
-                }
-                Ok(stats) = protocol.stat_stream.next() => {
-                    (self.on_server_stats)(GameClientServerStats(stats));
-                }
-                Some(Ok(msg)) = protocol.conn.uni_streams.next() => {
-                    let mut reader = BufReader::new(msg);
-
-                    let mut event_name = String::new();
-                    reader.read_line(&mut event_name).await.context("Event did not contain valid UTF-8")?;
-
-                    let mut event_data = Vec::new();
-
-                    reader.read_to_end(&mut event_data).await?;
-
-                    (self.on_event)(event_name, event_data.into_boxed_slice());
-                }
-            }
-        }
-    }
+        .el(),
+        cb(move |size| {
+            let size = (size * scale_factor as f32).as_uvec2().max(UVec2::ONE);
+            tracing::debug!("Resizing render target to {size:?}");
+            set_render_target(GameClientRenderTarget(Arc::new(RenderTarget::new(
+                &gpu, size, None,
+            ))))
+        }),
+    )
 }
 
 /// Set up and manage a connection to the server
 #[derive(Debug, Clone, Default)]
-pub struct GameClientNetworkStats {
+pub struct NetworkStats {
     pub latency_ms: u64,
     pub bytes_sent: u64,
     pub bytes_received: u64,
+    pub packets_sent: u64,
+    pub packets_lost: u64,
 }
 
-impl Display for GameClientNetworkStats {
+impl Display for NetworkStats {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?}ms, {}/s out, {}/s in", self.latency_ms, to_byte_unit(self.bytes_sent), to_byte_unit(self.bytes_received))
+        let loss = self.packets_lost as f32 / self.packets_sent as f32;
+        write!(
+            f,
+            "{:?} ms rtt, {}/s out, {}/s in, {:.03} loss",
+            self.latency_ms,
+            to_byte_unit(self.bytes_sent),
+            to_byte_unit(self.bytes_received),
+            if loss.is_nan() { 0.0 } else { loss },
+        )
     }
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct GameClientServerStats(pub FpsSample);
-
-/// Connnect to the server endpoint.
-/// Does not handle a protocol.
-#[tracing::instrument(level = "debug")]
-pub async fn open_connection(server_addr: SocketAddr) -> anyhow::Result<NewConnection> {
-    log::debug!("Connecting to world instance: {server_addr:?}");
-
-    let endpoint = create_client_endpoint_random_port().context("Failed to create client endpoint")?;
-
-    log::debug!("Got endpoint");
-    let conn = endpoint.connect(server_addr, "localhost")?.await?;
-
-    log::debug!("Got connection");
-    Ok(conn)
 }

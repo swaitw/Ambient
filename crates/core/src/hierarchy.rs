@@ -1,28 +1,54 @@
-use std::{collections::HashSet, fs::File, path::PathBuf};
+use std::collections::HashSet;
 
 use ambient_ecs::{
-    components, query, Component, ComponentValue, Debuggable, Description, ECSError, EntityId, MaybeResource, Name, Networked, Store, World,
+    generated::hierarchy::components::unmanaged_children, query, Component, ComponentValue,
+    ECSError, Entity, EntityId, SystemGroup, World,
 };
-use ambient_std::{asset_cache::SyncAssetKeyExt, download_asset::AssetsCacheDir};
 use itertools::Itertools;
 use yaml_rust::YamlEmitter;
 
-use crate::{asset_cache, name};
+pub use ambient_ecs::generated::hierarchy::components::{children, parent};
 
-components!("ecs", {
-    @[Debuggable, Networked, Store, Name["Parent"], Description["The parent of this entity."]]
-    parent: EntityId,
-    @[Debuggable, Networked, Store, MaybeResource, Name["Children"], Description["The children of this entity."]]
-    children: Vec<EntityId>,
-});
+use crate::name;
 
-pub fn despawn_recursive(world: &mut World, entity: EntityId) {
-    if let Ok(children) = world.set(entity, children(), vec![]) {
-        for c in children {
-            despawn_recursive(world, c);
-        }
-    }
-    world.despawn(entity);
+pub fn systems() -> SystemGroup {
+    SystemGroup::new(
+        "hierarchy",
+        vec![
+            query(parent().changed()).to_system_with_name("update_children", |q, world, qs, _| {
+                for (id, parent) in q.collect_cloned(world, qs) {
+                    if world.has_component(parent, unmanaged_children()) {
+                        continue;
+                    }
+                    if let Ok(children) = world.get_mut(parent, children()) {
+                        if !children.contains(&id) {
+                            children.push(id);
+                        }
+                    } else {
+                        let _ = world.add_component(parent, children(), vec![id]);
+                    }
+                }
+            }),
+            query(parent()).despawned().to_system_with_name(
+                "remove_children",
+                |q, world, qs, _| {
+                    for (id, parent) in q.collect_cloned(world, qs) {
+                        if world.has_component(parent, unmanaged_children()) {
+                            continue;
+                        }
+                        if let Ok(children) = world.get_mut(parent, children()) {
+                            children.retain(|c| *c != id);
+                        }
+                    }
+                },
+            ),
+        ],
+    )
+}
+
+pub fn despawn_recursive(world: &mut World, entity: EntityId) -> Option<Entity> {
+    despawn_children_recursive(world, entity);
+    world.despawn(entity)
 }
 pub fn despawn_children_recursive(world: &mut World, entity: EntityId) {
     if let Ok(children) = world.set(entity, children(), vec![]) {
@@ -40,7 +66,11 @@ pub fn add_child(world: &mut World, id: EntityId, child_id: EntityId) -> Result<
     Ok(())
 }
 
-pub fn find_child<F: Fn(&World, EntityId) -> bool>(world: &World, entity: EntityId, query: &F) -> Option<EntityId> {
+pub fn find_child<F: Fn(&World, EntityId) -> bool>(
+    world: &World,
+    entity: EntityId,
+    query: &F,
+) -> Option<EntityId> {
     if let Ok(children) = world.get_ref(entity, children()) {
         for child in children {
             if query(world, *child) {
@@ -61,14 +91,23 @@ pub fn apply_recursive<F: Fn(&mut World, EntityId)>(world: &mut World, entity: E
         }
     }
 }
-pub fn set_component_recursive<T: ComponentValue>(world: &mut World, entity: EntityId, component: Component<T>, value: T) {
+pub fn set_component_recursive<T: ComponentValue>(
+    world: &mut World,
+    entity: EntityId,
+    component: Component<T>,
+    value: T,
+) {
     apply_recursive(world, entity, &|world, entity| {
         if world.has_component(entity, component) {
             world.set(entity, component, value.clone()).unwrap();
         }
     })
 }
-pub fn find_child_with_name_ending(world: &World, entity: EntityId, name_ending: &str) -> Option<EntityId> {
+pub fn find_child_with_name_ending(
+    world: &World,
+    entity: EntityId,
+    name_ending: &str,
+) -> Option<EntityId> {
     find_child(world, entity, &|world, id| {
         if let Ok(name) = world.get_ref(id, name()) {
             name.ends_with(name_ending)
@@ -78,8 +117,16 @@ pub fn find_child_with_name_ending(world: &World, entity: EntityId, name_ending:
     })
 }
 
+#[cfg(not(target_os = "unknown"))]
 pub fn dump_world_hierarchy_to_tmp_file(world: &World) {
-    let cache_dir = world.resource_opt(asset_cache()).map(|a| AssetsCacheDir.get(a)).unwrap_or(PathBuf::from("tmp"));
+    use std::{fs::File, path::PathBuf};
+
+    use ambient_native_std::asset_cache::SyncAssetKeyExt;
+
+    let cache_dir = world
+        .resource_opt(crate::asset_cache())
+        .map(|a| ambient_native_std::download_asset::AssetsCacheDir.get(a))
+        .unwrap_or(PathBuf::from("tmp"));
     std::fs::create_dir_all(&cache_dir).ok();
     let path = cache_dir.join("hierarchy.yml");
     let mut f = File::create(&path).expect("Unable to create file");
@@ -87,6 +134,26 @@ pub fn dump_world_hierarchy_to_tmp_file(world: &World) {
 
     tracing::info!("Wrote hierarchy to {path:?}");
 }
+
+pub fn dump_world_hierarchy_to_clipboard(world: &World) {
+    let mut s = Vec::new();
+    dump_world_hierarchy(world, &mut s);
+
+    let s = String::from_utf8_lossy(&s);
+
+    ambient_sys::clipboard::set_background(s, |res| match res {
+        Ok(()) => tracing::info!("Dumped world hierarchy to clipboard"),
+        Err(err) => tracing::error!("Failed to dump world hierarchy to clipboard: {err:?}"),
+    });
+}
+
+pub fn dump_world_hierarchy_to_user(world: &World) {
+    #[cfg(target_os = "unknown")]
+    dump_world_hierarchy_to_clipboard(world);
+    #[cfg(not(target_os = "unknown"))]
+    dump_world_hierarchy_to_tmp_file(world);
+}
+
 pub fn dump_world_hierarchy(world: &World, f: &mut dyn std::io::Write) {
     use yaml_rust::yaml::Yaml;
     let mut visited = HashSet::new();
@@ -117,29 +184,49 @@ pub fn dump_world_hierarchy(world: &World, f: &mut dyn std::io::Write) {
     emitter.dump(&yaml_rust::yaml::Yaml::Array(roots)).unwrap();
     write!(f, "{out_str}").unwrap();
 }
-fn dump_entity_hierarchy(world: &World, entity: EntityId, visited: &mut HashSet<EntityId>) -> yaml_rust::yaml::Hash {
+fn dump_entity_hierarchy(
+    world: &World,
+    entity: EntityId,
+    visited: &mut HashSet<EntityId>,
+) -> yaml_rust::yaml::Hash {
     use yaml_rust::yaml::Yaml;
     visited.insert(entity);
     let mut res = yaml_rust::yaml::Hash::new();
     if let Some((id, entity_yml)) = world.dump_entity_to_yml(entity) {
-        let element = if let Some(Yaml::String(element)) = entity_yml.get(&Yaml::String("element".to_string())) {
+        let element = if let Some(Yaml::String(element)) =
+            entity_yml.get(&Yaml::String("element".to_string()))
+        {
             Some(element.clone())
         } else {
             None
         };
-        let name = if let Some(Yaml::String(name)) = entity_yml.get(&Yaml::String("name".to_string())) { Some(name.clone()) } else { None };
-        let key = vec![Some(id), element, name].into_iter().flatten().join(" • ");
+        let name =
+            if let Some(Yaml::String(name)) = entity_yml.get(&Yaml::String("name".to_string())) {
+                Some(name.clone())
+            } else {
+                None
+            };
+        let key = vec![Some(id), element, name]
+            .into_iter()
+            .flatten()
+            .join(" • ");
         res.insert(Yaml::String(key), Yaml::Hash(entity_yml));
         res.insert(
             Yaml::String("children".to_string()),
             Yaml::Array(if let Ok(children) = world.get_ref(entity, children()) {
-                children.iter().map(|c| yaml_rust::yaml::Yaml::Hash(dump_entity_hierarchy(world, *c, visited))).collect_vec()
+                children
+                    .iter()
+                    .map(|c| yaml_rust::yaml::Yaml::Hash(dump_entity_hierarchy(world, *c, visited)))
+                    .collect_vec()
             } else {
                 Vec::new()
             }),
         );
     } else {
-        res.insert(yaml_rust::yaml::Yaml::String("error".to_string()), yaml_rust::yaml::Yaml::String("no_such_entity".to_string()));
+        res.insert(
+            yaml_rust::yaml::Yaml::String("error".to_string()),
+            yaml_rust::yaml::Yaml::String("no_such_entity".to_string()),
+        );
     }
     res
 }

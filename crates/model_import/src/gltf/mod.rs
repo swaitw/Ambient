@@ -1,36 +1,72 @@
 use std::sync::Arc;
 
-use ambient_animation::{animation_bind_id_from_name, AnimationClip, AnimationOutputs, AnimationTarget, AnimationTrack};
+use ambient_animation::{AnimationClip, AnimationOutputs, AnimationTarget, AnimationTrack};
 use ambient_core::{
     bounding::local_bounding_aabb,
     hierarchy::{children, parent},
     name,
     transform::{local_to_parent, local_to_world, rotation, scale, translation},
 };
-use ambient_ecs::{Entity, World};
-use ambient_model::{model_skin_ix, model_skins, pbr_renderer_primitives_from_url, Model, ModelSkin, PbrRenderPrimitiveFromUrl};
+use ambient_ecs::{generated::animation::components::bind_id, Entity, World};
+use ambient_gpu::sampler::SamplerKey;
+use ambient_model::{
+    model_skin_ix, model_skins, pbr_renderer_primitives_from_url, Model, ModelSkin,
+    PbrRenderPrimitiveFromUrl,
+};
+use ambient_native_std::{
+    asset_cache::AssetCache,
+    asset_url::AbsAssetUrl,
+    mesh::{flip_winding, generate_tangents, MeshBuilder},
+    shapes::AABB,
+};
 use ambient_renderer::materials::pbr_material::PbrMaterialDesc;
-use ambient_std::{asset_cache::AssetCache, asset_url::AbsAssetUrl, mesh::Mesh, shapes::AABB};
-use glam::{uvec4, Mat4, Quat, UVec4, Vec2, Vec3, Vec4, Vec4Swizzles};
+use anyhow::Context;
+use glam::{uvec4, Mat4, Quat, Vec2, Vec3, Vec4, Vec4Swizzles};
 use gltf::animation::util::ReadOutputs;
 use itertools::Itertools;
 use relative_path::RelativePathBuf;
 
 use self::gltf_import::GltfImport;
-use crate::{dotdot_path, model_crate::ModelCrate};
+use crate::{
+    animation_bind_id::{BindIdNodeFuncs, BindIdReg},
+    dotdot_path,
+    model_crate::ModelCrate,
+};
 
 mod gltf_import;
 
-pub async fn import_url(assets: &AssetCache, url: &AbsAssetUrl, asset_crate: &mut ModelCrate) -> anyhow::Result<RelativePathBuf> {
+pub async fn import_url(
+    assets: &AssetCache,
+    url: &AbsAssetUrl,
+    asset_crate: &mut ModelCrate,
+) -> anyhow::Result<RelativePathBuf> {
     let content = url.download_bytes(assets).await?;
     let gltf = GltfImport::from_slice(url.to_string(), true, &content)?;
     import(&gltf, asset_crate).await
 }
 
-pub async fn import(import: &GltfImport, asset_crate: &mut ModelCrate) -> anyhow::Result<RelativePathBuf> {
-    let name_ = |name: Option<&str>| name.map(|x| format!("{x}_")).unwrap_or_default();
+pub async fn import(
+    import: &GltfImport,
+    asset_crate: &mut ModelCrate,
+) -> anyhow::Result<RelativePathBuf> {
+    let name_ = |name: Option<&str>| {
+        name.map(|x| format!("{}_", x.replace(['/', '\\'], "-")))
+            .unwrap_or_default()
+    };
+    let mut bind_ids = BindIdReg::<usize, gltf::scene::Node<'_>>::new(BindIdNodeFuncs {
+        node_to_id: |node| node.index(),
+        node_name: |node| node.name(),
+    });
 
-    let mut meshes = import.document.meshes().map(|mesh| mesh.primitives().map(|_| RelativePathBuf::new()).collect_vec()).collect_vec();
+    let mut meshes = import
+        .document
+        .meshes()
+        .map(|mesh| {
+            mesh.primitives()
+                .map(|_| RelativePathBuf::new())
+                .collect_vec()
+        })
+        .collect_vec();
     for (mesh_i, mesh) in import.document.meshes().enumerate() {
         for (prim_i, primitive) in mesh.primitives().enumerate() {
             let reader = primitive.reader(|buffer| Some(&import.buffers[buffer.index()]));
@@ -40,36 +76,79 @@ pub async fn import(import: &GltfImport, asset_crate: &mut ModelCrate) -> anyhow
                 texcoords.push(tc.into_f32().map(|x| x.into()).collect::<Vec<Vec2>>());
             }
 
-            let flip_indices = true;
-            let mut cpu_mesh = Mesh {
-                name: format!("{}:{}:{}", import.name, mesh.index(), primitive.index()),
-                positions: reader.read_positions().map(|v| v.map(|x| x.into()).collect::<Vec<Vec3>>()),
-                normals: reader.read_normals().map(|v| v.map(|x| x.into()).collect::<Vec<Vec3>>()),
-                tangents: reader.read_tangents().map(|v| v.map(|x| Vec4::from(x).xyz()).collect::<Vec<Vec3>>()),
-                texcoords,
-                colors: None,
-                joint_indices: reader
-                    .read_joints(0)
-                    .map(|v| v.into_u16().map(|v| uvec4(v[0] as u32, v[1] as u32, v[2] as u32, v[3] as u32)).collect::<Vec<UVec4>>()),
-                joint_weights: reader.read_weights(0).map(|v| v.into_f32().map(|x| x.into()).collect::<Vec<Vec4>>()),
-                indices: reader.read_indices().map(|v| {
-                    if flip_indices {
-                        v.into_u32()
-                            .chunks(3)
-                            .into_iter()
-                            .flat_map(|chunk| {
-                                let mut chunk = chunk.collect_vec();
-                                chunk.swap(1, 2);
-                                chunk
-                            })
-                            .collect::<Vec<u32>>()
-                    } else {
-                        v.into_u32().collect::<Vec<u32>>()
-                    }
-                }),
+            let positions = reader
+                .read_positions()
+                .context("GLTF mesh must contain vertex positions")?
+                .map(Vec3::from)
+                .collect::<Vec<Vec3>>();
+
+            let mut indices = reader
+                .read_indices()
+                .context("GLTF mesh must contain an index buffer")?
+                .into_u32()
+                .collect_vec();
+            flip_winding(&mut indices);
+
+            let normals = if let Some(normals) = reader.read_normals() {
+                normals.into_iter().map(Vec3::from).collect_vec()
+            } else {
+                Vec::new()
             };
-            cpu_mesh.try_ensure_tangents();
-            let path = asset_crate.meshes.insert(&format!("{}{}_{}", name_(mesh.name()), mesh.index(), primitive.index()), cpu_mesh).path;
+
+            let mut tangents = if let Some(tangents) = reader.read_tangents() {
+                tangents
+                    .into_iter()
+                    .map(|x| Vec4::from(x).xyz())
+                    .collect_vec()
+            } else {
+                Vec::new()
+            };
+            if tangents.is_empty()
+                && texcoords.get(0).map(|t| !t.is_empty()).unwrap_or_default()
+                && !normals.is_empty()
+            {
+                tangents = generate_tangents(&positions, &texcoords[0], &normals, &indices);
+            }
+
+            let joint_indices = if let Some(joints) = reader.read_joints(0) {
+                joints
+                    .into_u16()
+                    .map(|x| uvec4(x[0] as u32, x[1] as u32, x[2] as u32, x[3] as u32))
+                    .collect_vec()
+            } else {
+                Vec::new()
+            };
+
+            let joint_weights = if let Some(weights) = reader.read_weights(0) {
+                weights.into_f32().map(Vec4::from).collect_vec()
+            } else {
+                Vec::new()
+            };
+
+            let cpu_mesh = MeshBuilder {
+                positions,
+                normals,
+                tangents,
+                texcoords,
+                indices,
+                joint_indices,
+                joint_weights,
+                ..MeshBuilder::default()
+            }
+            .build()?;
+
+            let path = asset_crate
+                .meshes
+                .insert(
+                    &format!(
+                        "{}{}_{}",
+                        name_(mesh.name()),
+                        mesh.index(),
+                        primitive.index()
+                    ),
+                    cpu_mesh,
+                )
+                .path;
             meshes[mesh_i][prim_i] = path;
         }
     }
@@ -79,7 +158,7 @@ pub async fn import(import: &GltfImport, asset_crate: &mut ModelCrate) -> anyhow
             .channels()
             .map(|channel| {
                 let reader = channel.reader(|buffer| Some(&import.buffers[buffer.index()]));
-                let target = AnimationTarget::BinderId(animation_bind_id_from_name(channel.target().node().name().unwrap_or("")));
+                let target = AnimationTarget::BinderId(bind_ids.get(&channel.target().node()));
                 let inputs = reader.read_inputs().unwrap().collect();
                 match reader.read_outputs() {
                     Some(ReadOutputs::Translations(data)) => AnimationTrack {
@@ -112,15 +191,22 @@ pub async fn import(import: &GltfImport, asset_crate: &mut ModelCrate) -> anyhow
             .collect();
         let mut animation_clip = AnimationClip::from_tracks(tracks);
         animation_clip.id = animation.name().unwrap_or("").to_string();
-        asset_crate.animations.insert(&format!("{}{}", name_(animation.name()), index), animation_clip);
+        asset_crate.animations.insert(
+            &format!("{}{}", name_(animation.name()), index),
+            animation_clip,
+        );
     }
 
     let mut images = Vec::new();
     for (index, image) in import.images.iter().enumerate() {
         let mut img = match image.format {
-            gltf::image::Format::R8G8B8A8 => image::RgbaImage::from_raw(image.width, image.height, image.pixels.clone()).unwrap(),
+            gltf::image::Format::R8G8B8A8 => {
+                image::RgbaImage::from_raw(image.width, image.height, image.pixels.clone()).unwrap()
+            }
             gltf::image::Format::R8G8B8 => {
-                let img = image::RgbImage::from_raw(image.width, image.height, image.pixels.clone()).unwrap();
+                let img =
+                    image::RgbImage::from_raw(image.width, image.height, image.pixels.clone())
+                        .unwrap();
                 image::DynamicImage::ImageRgb8(img).into_rgba8()
             }
             gltf::image::Format::R16G16B16A16 => {
@@ -133,11 +219,18 @@ pub async fn import(import: &GltfImport, asset_crate: &mut ModelCrate) -> anyhow
                 image::DynamicImage::ImageRgba16(img).into_rgba8()
             }
             gltf::image::Format::R8 => {
-                let img = image::GrayImage::from_raw(image.width, image.height, image.pixels.clone()).unwrap();
+                let img =
+                    image::GrayImage::from_raw(image.width, image.height, image.pixels.clone())
+                        .unwrap();
                 image::DynamicImage::ImageLuma8(img).into_rgba8()
             }
             gltf::image::Format::R8G8 => {
-                let img = image::GrayAlphaImage::from_raw(image.width, image.height, image.pixels.clone()).unwrap();
+                let img = image::GrayAlphaImage::from_raw(
+                    image.width,
+                    image.height,
+                    image.pixels.clone(),
+                )
+                .unwrap();
                 image::DynamicImage::ImageLumaA8(img).into_rgba8()
             }
             gltf::image::Format::R16 => unimplemented!(),
@@ -181,25 +274,43 @@ pub async fn import(import: &GltfImport, asset_crate: &mut ModelCrate) -> anyhow
         let mat_def = PbrMaterialDesc {
             name: mat.name().map(|x| x.to_string()),
             source: Some(import.name.clone()),
-            base_color_factor: Some(glam::Vec4::from_slice(&mat.pbr_metallic_roughness().base_color_factor())),
+            base_color_factor: Some(glam::Vec4::from_slice(
+                &mat.pbr_metallic_roughness().base_color_factor(),
+            )),
             emissive_factor: Some(glam::Vec3::from_slice(&mat.emissive_factor()).extend(0.)),
             transparent: Some(mat.alpha_mode() == gltf::material::AlphaMode::Blend),
             alpha_cutoff: mat.alpha_cutoff(),
-            metallic: pbr.metallic_factor(),
-            roughness: pbr.roughness_factor(),
-            base_color: pbr.base_color_texture().and_then(|x| images.get(x.texture().index())).map(|x| dotdot_path(x).into()),
-            normalmap: mat.normal_texture().and_then(|x| images.get(x.texture().index())).map(|x| dotdot_path(x).into()),
+            metallic_factor: pbr.metallic_factor(),
+            roughness_factor: pbr.roughness_factor(),
+            base_color: pbr
+                .base_color_texture()
+                .and_then(|x| images.get(x.texture().index()))
+                .map(|x| dotdot_path(x).into()),
+            normalmap: mat
+                .normal_texture()
+                .and_then(|x| images.get(x.texture().index()))
+                .map(|x| dotdot_path(x).into()),
             metallic_roughness: pbr
                 .metallic_roughness_texture()
                 .and_then(|x| images.get(x.texture().index()))
                 .map(|x| dotdot_path(x).into()),
             double_sided: Some(mat.double_sided()),
             opacity: None,
+            // TODO: Each GLTF texture knows its sampler modes, but Ambient's
+            // current material model assumes a single sampler for all textures
+            // in a material. Revisit once the renderer supports arbitrary
+            // texture-sampler pairs.
+            sampler: Some(SamplerKey::LINEAR_CLAMP_TO_EDGE),
         };
-        materials.push(asset_crate.materials.insert(&format!("{}{}", name_(mat.name()), index), mat_def).path);
+        materials.push(
+            asset_crate
+                .materials
+                .insert(&format!("{}{}", name_(mat.name()), index), mat_def)
+                .path,
+        );
     }
 
-    let mut world = World::new("gltf");
+    let mut world = World::new("gltf", ambient_ecs::WorldContext::Prefab);
     let nodes = import
         .document
         .nodes()
@@ -210,7 +321,8 @@ pub async fn import(import: &GltfImport, asset_crate: &mut ModelCrate) -> anyhow
                 .with(translation(), Vec3::from_slice(&trans))
                 .with(rotation(), Quat::from_slice(&rot))
                 .with(scale(), Vec3::from_slice(&scal))
-                .with_default(local_to_world());
+                .with(local_to_world(), Default::default())
+                .with(bind_id(), bind_ids.get(&node));
 
             if let Some(node_name) = node.name() {
                 ed.set(name(), node_name.to_string());
@@ -221,7 +333,10 @@ pub async fn import(import: &GltfImport, asset_crate: &mut ModelCrate) -> anyhow
                     .primitives()
                     .map(|primitive| PbrRenderPrimitiveFromUrl {
                         mesh: dotdot_path(&meshes[mesh_.index()][primitive.index()]).into(),
-                        material: primitive.material().index().map(|material_index| dotdot_path(&materials[material_index]).into()),
+                        material: primitive
+                            .material()
+                            .index()
+                            .map(|material_index| dotdot_path(&materials[material_index]).into()),
                         lod: 0,
                     })
                     .collect_vec();
@@ -231,7 +346,10 @@ pub async fn import(import: &GltfImport, asset_crate: &mut ModelCrate) -> anyhow
                     .primitives()
                     .map(|primitive| {
                         let bb = primitive.bounding_box();
-                        AABB { min: bb.min.into(), max: bb.max.into() }
+                        AABB {
+                            min: bb.min.into(),
+                            max: bb.max.into(),
+                        }
                     })
                     .collect_vec();
                 if let Some(aabb) = AABB::unions(&aabbs) {
@@ -266,14 +384,23 @@ pub async fn import(import: &GltfImport, asset_crate: &mut ModelCrate) -> anyhow
         if !childs.is_empty() {
             for child_id in &childs {
                 world.add_component(*child_id, parent(), *id).unwrap();
-                world.add_component(*child_id, local_to_parent(), Default::default()).unwrap();
+                world
+                    .add_component(*child_id, local_to_parent(), Default::default())
+                    .unwrap();
             }
             world.add_component(*id, children(), childs).unwrap();
         }
     }
-    let roots = import.document.scenes().flat_map(|s| s.nodes().map(|x| nodes[x.index()])).collect_vec();
+    let roots = import
+        .document
+        .scenes()
+        .flat_map(|s| s.nodes().map(|x| nodes[x.index()]))
+        .collect_vec();
     world.add_resource(children(), roots);
     world.add_resource(name(), import.name.to_string());
 
-    Ok(asset_crate.models.insert(ModelCrate::MAIN, Model(world)).path)
+    Ok(asset_crate
+        .models
+        .insert(ModelCrate::MAIN, Model(world))
+        .path)
 }

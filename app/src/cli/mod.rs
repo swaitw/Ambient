@@ -1,134 +1,145 @@
 use std::path::PathBuf;
 
-use clap::{Args, Parser};
+use clap::{Args, Parser, Subcommand};
 
-pub mod new_project;
+pub mod assets;
+pub mod join;
+pub mod login;
+pub mod package;
+
+mod package_path;
+pub use package_path::*;
+
+use self::{
+    assets::Assets,
+    join::Join,
+    package::{
+        build::Build, deploy::Deploy, new::New, run::Run, serve::Serve, Package, PackageArgs,
+    },
+};
 
 #[derive(Parser, Clone)]
 #[command(author, version, about, long_about = None)]
 #[command(propagate_version = true)]
-pub enum Cli {
-    /// Create a new Ambient project
-    New {
-        #[command(flatten)]
-        project_args: ProjectCli,
-        #[arg(short, long)]
-        name: Option<String>,
-    },
-    /// Builds and runs the project locally
-    Run {
-        #[command(flatten)]
-        project_args: ProjectCli,
-        #[command(flatten)]
-        host_args: HostCli,
-        #[command(flatten)]
-        run_args: RunCli,
-    },
-    /// Builds the project
-    Build {
-        #[command(flatten)]
-        project_args: ProjectCli,
-    },
-    /// Builds and runs the project in server-only mode
-    Serve {
-        #[command(flatten)]
-        project_args: ProjectCli,
-        #[command(flatten)]
-        host_args: HostCli,
-    },
-    /// View an asset
-    View {
-        #[command(flatten)]
-        project_args: ProjectCli,
-        /// Relative to the project path
-        asset_path: PathBuf,
-    },
-    /// Join a multiplayer session
-    Join {
-        #[command(flatten)]
-        run_args: RunCli,
-        /// The server to connect to; defaults to localhost
-        host: Option<String>,
-    },
-    /// Updates all WASM APIs with the core primitive components (not for users)
-    #[cfg(not(feature = "production"))]
-    #[command(hide = true)]
-    UpdateInterfaceComponents,
+pub struct Cli {
+    #[command(subcommand)]
+    pub command: Commands,
 }
-#[derive(Args, Clone)]
-pub struct RunCli {
-    /// If set, show a debugger that can be used to investigate the state of the project. Can also be accessed through the `AMBIENT_DEBUGGER` environment variable
+
+#[derive(Parser, Clone, Debug)]
+pub enum Commands {
+    New(New),
+    Run(Run),
+    Build(Build),
+    Deploy(Deploy),
+    Serve(Serve),
+    Join(Join),
+    Package {
+        #[command(subcommand)]
+        package: Package,
+    },
+    /// Asset manipulation and migration
+    Assets {
+        #[command(subcommand)]
+        assets: Assets,
+    },
+    /// Log into Ambient and save your API token to settings
+    Login,
+}
+
+#[derive(Subcommand, Clone, Copy, Debug)]
+pub enum GoldenImageCommand {
+    /// Renders an image and saves it after waiting for the specified number of seconds
+    #[command(name = "golden-image-update")]
+    Update {
+        #[arg(long)]
+        wait_seconds: f32,
+    },
+    /// Renders an image and compares it against existing golden image and timeouts after the specified number seconds
+    #[command(name = "golden-image-check")]
+    Check {
+        #[arg(long)]
+        timeout_seconds: f32,
+    },
+}
+
+#[derive(Args, Clone, Debug)]
+pub struct ClientCli {
+    /// If set, show a debugger that can be used to investigate the state of the package.
+    /// Can also be accessed through the `AMBIENT_DEBUGGER` environment variable
     #[arg(short, long)]
     pub debugger: bool,
+
+    /// If set, no audio will be played, which can be useful for debugging
+    #[arg(long)]
+    pub mute_audio: bool,
 
     /// Run in headless mode
     #[arg(long)]
     pub headless: bool,
 
-    /// Take a screenshot after N seconds, compare it to the existing one and then exit with an exit code of 1 if they are different
-    #[arg(long)]
-    pub screenshot_test: Option<f32>,
+    /// Run golden image test
+    #[command(subcommand)]
+    pub golden_image: Option<GoldenImageCommand>,
 
     /// The user ID to join this server with
     #[clap(short, long)]
     pub user_id: Option<String>,
-}
-#[derive(Args, Clone)]
-pub struct ProjectCli {
-    /// The path of the project to run; if not specified, this will default to the current directory
-    pub path: Option<PathBuf>,
 
-    /// Build all the assets with full optimization; this will make debugging more difficult
-    #[arg(short, long)]
-    pub release: bool,
-}
-#[derive(Args, Clone)]
-pub struct HostCli {
-    /// Provide a public address or IP to the instance, which will allow users to connect to this instance over the internet
+    /// Allows connecting to servers with a mismatched version. Only available in non-production builds.
     ///
-    /// Defaults to localhost
+    /// DO NOT USE THIS UNLESS YOU KNOW WHAT YOU ARE DOING.
+    #[cfg(not(feature = "production"))]
     #[arg(long)]
-    pub public_host: Option<String>,
+    pub dev_allow_version_mismatch: bool,
+
+    /// Specify a trusted certificate authority
+    #[arg(long)]
+    pub ca: Option<PathBuf>,
+
+    /// Window position X override
+    #[arg(long)]
+    pub window_x: Option<i32>,
+
+    /// Window position Y override
+    #[arg(long)]
+    pub window_y: Option<i32>,
+
+    /// Window width override
+    #[arg(long)]
+    pub window_width: Option<u32>,
+
+    /// Window height override
+    #[arg(long)]
+    pub window_height: Option<u32>,
 }
 
 impl Cli {
-    /// Extract run-relevant state only
-    pub fn run(&self) -> Option<&RunCli> {
-        match self {
-            Cli::New { .. } => None,
-            Cli::Run { run_args, .. } => Some(run_args),
-            Cli::Build { .. } => None,
-            Cli::Serve { .. } => None,
-            Cli::View { .. } => None,
-            Cli::Join { run_args, .. } => Some(run_args),
-            #[cfg(not(feature = "production"))]
-            Cli::UpdateInterfaceComponents => None,
+    /// Extract package-relevant state only
+    pub fn package(&self) -> Option<&PackageArgs> {
+        match &self.command {
+            Commands::Package { package } => Some(package.args()),
+            Commands::New(New { package, .. }) => Some(package),
+            Commands::Run(Run { package, .. }) => Some(package),
+            Commands::Build(Build { package, .. }) => Some(package),
+            Commands::Deploy(Deploy { package, .. }) => Some(package),
+            Commands::Serve(Serve { package, .. }) => Some(package),
+            Commands::Join(Join { .. }) => None,
+            Commands::Assets { .. } => None,
+            Commands::Login => None,
         }
     }
-    /// Extract project-relevant state only
-    pub fn project(&self) -> Option<&ProjectCli> {
-        match self {
-            Cli::New { project_args, .. } => Some(project_args),
-            Cli::Run { project_args, .. } => Some(project_args),
-            Cli::Build { project_args, .. } => Some(project_args),
-            Cli::Serve { project_args, .. } => Some(project_args),
-            Cli::View { project_args, .. } => Some(project_args),
-            Cli::Join { .. } => None,
-            #[cfg(not(feature = "production"))]
-            Cli::UpdateInterfaceComponents => None,
-        }
-    }
-    /// Extract host-relevant state only
-    pub fn host(&self) -> Option<&HostCli> {
-        match self {
-            Cli::New { .. } => None,
-            Cli::Run { host_args, .. } => Some(host_args),
-            Cli::Build { .. } => None,
-            Cli::Serve { host_args, .. } => Some(host_args),
-            Cli::View { .. } => None,
-            Cli::Join { .. } => None,
-            #[cfg(not(feature = "production"))]
-            Cli::UpdateInterfaceComponents => None,
+    pub fn use_release_build(&self) -> bool {
+        use Commands as C;
+
+        match &self.command {
+            C::Deploy(Deploy { package, .. }) | C::Serve(Serve { package, .. }) => {
+                package.is_release().unwrap_or(true)
+            }
+            C::Run(Run { package, .. }) | C::Build(Build { package, .. }) => {
+                package.is_release().unwrap_or(false)
+            }
+            C::New(_) | C::Join(_) | C::Assets { .. } | C::Package { .. } | C::Login => false,
         }
     }
 }

@@ -1,75 +1,23 @@
 # Installing
 
-The easiest way to install Ambient is to download the latest binary release from the [GitHub releases](https://github.com/AmbientRun/Ambient/releases).
-Currently, there are builds for Windows x64, Linux x64, and Mac ARM64. For other platforms, use the [installing from Git](#installing-from-git) method.
+Native use of Ambient, for both developing and playing games, is easy. We have a version manager that
+will retrieve a pre-built version of Ambient for your platform. This is the recommended way to use Ambient.
 
-You will also need [Rust](https://www.rust-lang.org/) installed with the `wasm32-wasi` toolchain so that you can compile Ambient modules.
-Note that Ambient compiles Rust code with stable Rust, so you must make sure that `wasm32-wasi` is installed for `stable`:
+The steps are as follows, where the commands are for your terminal of choice:
 
-```sh
-rustup target add --toolchain stable wasm32-wasi
-```
+1.  [Install Rust](https://www.rust-lang.org/). Note that the minimum supported version is 1.71.0, and you may need to update.
+2.  Add the `wasm32-wasi` toolchain. This lets you compile Rust code for Ambient.
 
-## Installing from Git
+        rustup target add --toolchain stable wasm32-wasi
 
-Ambient can be installed through `cargo install`, which will download and build the repository. Our current minimum supported Rust version is 1.67.0, as we use recently-stabilised standard library features.
+3.  Install the Ambient version manager:
 
-To install the latest released version from Git, run the following:
+        cargo install ambient
 
-```sh
-cargo install --git https://github.com/AmbientRun/Ambient.git --tag v0.1.1
-```
+The native client of Ambient currently runs on Windows, Linux and macOS.
 
-To install the latest version on the `main` branch, run the following:
+> **Warning**: If you are using Command Prompt on Windows, ensure that you do not have an `ambient` executable in the directory that you are running the command from.
+>
+> This is because Command Prompt will prefer the local executable over the one installed by Cargo.
 
-```sh
-cargo install --git https://github.com/AmbientRun/Ambient.git
-```
-
-Note that if you are running a project outside of the `guest/rust` workspace, it is likely that the published version of the API will be incompatible with `main`, and you will need to specify the dependency manually.
-
-### Building problems and solutions
-
-- If you run into troubles building russimp/assimp, you can turn it off by installing with `--no-default-features`. See [this issue](https://github.com/AmbientRun/Ambient/issues/173) for more details.
-
-### Build dependencies: Linux/Ubuntu
-
-For the above to work on Linux, you also need to install the following build dependencies:
-
-```sh
-apt-get install -y \
-    build-essential cmake pkg-config \
-    libfontconfig1-dev clang libasound2-dev ninja-build
-```
-
-## Installing via asdf (Linux, Macos)
-
-Thanks to [@jtakakura](https://github.com/jtakakura), Ambient can also be installed using [asdf](https://asdf-vm.com/) by running `asdf plugin add ambient`. For more details visit https://github.com/jtakakura/asdf-ambient.
-
-## Running on headless Linux/Ubuntu
-
-To run on a headless Linux machine, install the following dependencies in addition to the dependencies specified above:
-
-```sh
-add-apt-repository ppa:oibaf/graphics-drivers -y
-apt-get update
-apt install -y libxcb-xfixes0-dev mesa-vulkan-drivers
-```
-
-Ambient currently assumes that you have access to GPU drivers (but not necessarily a GPU) in headless mode. This requirement may be relaxed in future.
-
-## Dockerfile
-
-A `Dockerfile` is also provided that provides a headless Debian environment with all of the dependencies required to run Ambient as a server. This Dockerfile is intended for development, not production, so it has more dependencies than are strictly required to run Ambient.
-
-To build the Dockerfile:
-
-```sh
-docker build -t ambient .
-```
-
-To run the Dockerfile with `bash` in the current directory:
-
-```sh
-docker run --rm -it -e bash -v "$(pwd)":/app ambient
-```
+Next, try the [tutorial](../tutorials/game/0_intro.md) to create your first Ambient game!

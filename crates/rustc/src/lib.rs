@@ -7,6 +7,7 @@ use std::{
 };
 
 use anyhow::Context;
+use is_terminal::IsTerminal;
 use itertools::Itertools;
 
 const MINIMUM_RUST_VERSION: Version = Version((1, 65, 0));
@@ -42,43 +43,47 @@ impl Rust {
     pub fn build(
         &self,
         working_directory: &Path,
-        package_name: &str,
         optimize: bool,
         features: &[&str],
-    ) -> anyhow::Result<Option<Vec<u8>>> {
+    ) -> anyhow::Result<Vec<(PathBuf, Vec<u8>)>> {
         let features = if features.is_empty() {
             vec![]
         } else {
             vec!["--features".to_string(), features.iter().join(",")]
         };
 
-        let path = parse_command_result_for_filenames(
-            self.0.run(
-                "cargo",
-                [
-                    "build",
-                    if optimize { "--release" } else { "" },
-                    "--message-format",
-                    "json",
-                    "--target",
-                    "wasm32-wasi",
-                    "--package",
-                    package_name,
-                ]
-                .into_iter()
-                .chain(features.iter().map(|s| s.as_str()))
-                .filter(|a| !a.is_empty()),
-                Some(working_directory),
-            ),
-        )?
-        .into_iter()
-        .find(|p| p.extension().unwrap_or_default() == "wasm");
+        // HACK: If this is being called from within a terminal context, tell Cargo to build
+        // with color on so that we can see the color in the resulting output.
+        //
+        // This information could probably be propagated from upwards to make this crate
+        // usable in other contexts, but hey, fix it when it's a problem, not before.
+        let is_terminal = std::io::stdout().is_terminal();
+        let result = self.0.run(
+            "cargo",
+            [
+                "build",
+                if optimize { "--release" } else { "" },
+                if is_terminal { "--color always" } else { "" },
+                "--message-format",
+                if is_terminal {
+                    "json-diagnostic-rendered-ansi"
+                } else {
+                    "json"
+                },
+                "--target wasm32-wasi",
+            ]
+            .into_iter()
+            .flat_map(|s| s.split_ascii_whitespace())
+            .chain(features.iter().map(|s| s.as_str()))
+            .filter(|a| !a.is_empty()),
+            Some(working_directory),
+        );
 
-        if let Some(path) = path {
-            Ok(Some(std::fs::read(path)?))
-        } else {
-            Ok(None)
-        }
+        parse_command_result_for_filenames(working_directory, result)?
+            .into_iter()
+            .filter(|p| p.extension().unwrap_or_default() == "wasm")
+            .map(|p| anyhow::Ok((p.clone(), std::fs::read(&p)?)))
+            .collect()
     }
 }
 
@@ -102,19 +107,19 @@ impl Installation {
         )
     }
 
-    fn get_version_for(&self, task: &str, cmd: &str) -> Result<Version, anyhow::Error> {
+    fn get_version_for(&self, task: &str, cmd: &str) -> anyhow::Result<Version> {
         Ok(Version(
             handle_command_failure(task, self.run(cmd, ["--version"], None))?
                 .split_whitespace()
                 .nth(1)
-                .context("failed to extract version component (1)")?
+                .context("Failed to extract version component (1)")?
                 .split('-')
                 .next()
-                .context("failed to extract version component (2)")?
+                .context("Failed to extract version component (2)")?
                 .split('.')
                 .map(|i| i.parse().unwrap_or_default())
                 .collect_tuple()
-                .context("failed to collect version into tuple")?,
+                .context("Failed to collect version into tuple")?,
         ))
     }
 
@@ -149,6 +154,7 @@ impl Installation {
 }
 
 fn parse_command_result_for_filenames(
+    working_directory: &Path,
     result: anyhow::Result<(bool, String, String)>,
 ) -> anyhow::Result<Vec<PathBuf>> {
     let (success, stdout, stderr) = result?;
@@ -162,15 +168,25 @@ fn parse_command_result_for_filenames(
         })
         .collect();
 
+    let target_manifest = working_directory.join("Cargo.toml");
     if success {
-        let Some(last_compiler_artifact) = messages
+        let compiler_artifacts = messages
             .iter()
-            .rfind(|v| v.get("reason").and_then(|v| v.as_str()) == Some("compiler-artifact")) else { return Ok(vec![]) };
+            .filter(|v| v.get("reason").and_then(|v| v.as_str()) == Some("compiler-artifact"));
 
-        let filenames = last_compiler_artifact
-            .get("filenames")
-            .and_then(|f| f.as_array())
-            .context("no filenames")?;
+        let filenames = compiler_artifacts
+            .filter(|a| {
+                a.get("manifest_path")
+                    .and_then(|p| p.as_str())
+                    .is_some_and(|p| Path::new(p) == target_manifest.as_path())
+            })
+            .flat_map(|a| {
+                a.get("filenames")
+                    .and_then(|f| f.as_array())
+                    .cloned()
+                    .unwrap_or_default()
+            })
+            .collect::<Vec<_>>();
 
         Ok(filenames
             .iter()
@@ -191,7 +207,7 @@ fn parse_command_result_for_filenames(
             .join("");
 
         anyhow::bail!(
-            "failed to compile, {}",
+            "Failed to compile\n{}",
             generate_error_report(stdout_errors, stderr)
         );
     }
@@ -204,7 +220,7 @@ fn handle_command_failure(
     let (success, stdout, stderr) = result?;
     if !success {
         anyhow::bail!(
-            "failed to {task}: {}",
+            "Failed to {task}\n{}",
             generate_error_report(stdout, stderr)
         )
     }
@@ -215,8 +231,8 @@ fn generate_error_report(stdout: String, stderr: String) -> String {
     [("stdout", stdout), ("stderr", stderr)]
         .into_iter()
         .filter(|(_, errors)| !errors.is_empty())
-        .map(|(name, errors)| format!("{name}: {errors}"))
-        .join(", ")
+        .map(|(name, errors)| format!("{name}:\n{}\n", errors.trim()))
+        .join("\n")
 }
 
 fn exe(app: &str) -> String {

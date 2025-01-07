@@ -7,8 +7,11 @@ use std::{
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 
-use super::{ArchetypeFilter, Component, ComponentValue, Entity, EntityId, FramedEventsReader, Query, QueryState, World};
-use crate::{ComponentDesc, ComponentEntry, Serializable};
+use super::{
+    ArchetypeFilter, Component, ComponentValue, Entity, EntityId, FramedEventsReader, Query,
+    QueryState, World,
+};
+use crate::{ComponentDesc, ComponentEntry};
 
 #[derive(Serialize, Deserialize, Debug, Default, Clone)]
 pub struct WorldDiff {
@@ -16,26 +19,36 @@ pub struct WorldDiff {
 }
 impl WorldDiff {
     pub fn new() -> Self {
-        Self { changes: Vec::new() }
+        Self {
+            changes: Vec::new(),
+        }
     }
     pub fn set<T: ComponentValue>(self, id: EntityId, component: Component<T>, value: T) -> Self {
         self.set_entry(id, ComponentEntry::new(component, value))
     }
-    pub fn add_component<T: ComponentValue>(self, id: EntityId, component: Component<T>, value: T) -> Self {
+    pub fn add_component<T: ComponentValue>(
+        self,
+        id: EntityId,
+        component: Component<T>,
+        value: T,
+    ) -> Self {
         self.add_entry(id, ComponentEntry::new(component, value))
     }
 
     pub fn remove_component(mut self, id: EntityId, component: ComponentDesc) -> Self {
-        self.changes.push(WorldChange::RemoveComponents(id, vec![component]));
+        self.changes
+            .push(WorldChange::RemoveComponents(id, vec![component]));
         self
     }
 
     pub fn remove_components_raw(mut self, id: EntityId, components: Vec<ComponentDesc>) -> Self {
-        self.changes.push(WorldChange::RemoveComponents(id, components));
+        self.changes
+            .push(WorldChange::RemoveComponents(id, components));
         self
     }
     pub fn set_entry(mut self, id: EntityId, entry: ComponentEntry) -> Self {
-        self.changes.push(WorldChange::Set(id, entry));
+        self.changes
+            .push(WorldChange::SetComponents(id, Entity::from(vec![entry])));
         self
     }
     pub fn add_entry(mut self, id: EntityId, entry: ComponentEntry) -> Self {
@@ -45,16 +58,13 @@ impl WorldDiff {
         self
     }
     pub fn despawn(mut self, ids: Vec<EntityId>) -> Self {
-        self.changes.extend(ids.into_iter().map(WorldChange::Despawn));
+        self.changes
+            .extend(ids.into_iter().map(WorldChange::Despawn));
         self
     }
-    pub fn apply(self, world: &mut World, spanwed_extra_data: Entity, create_revert: bool) -> Option<Self> {
-        let revert_changes =
-            self.changes.into_iter().map(|change| change.apply(world, &spanwed_extra_data, false, create_revert)).collect_vec();
-        if create_revert {
-            Some(Self { changes: revert_changes.into_iter().rev().flatten().collect_vec() })
-        } else {
-            None
+    pub fn apply(self, world: &mut World, spawned_extra_data: Entity) {
+        for change in self.changes.into_iter() {
+            change.apply(world, &spawned_extra_data, false);
         }
     }
     pub fn is_empty(&self) -> bool {
@@ -64,40 +74,94 @@ impl WorldDiff {
     pub fn from_a_to_b(filter: WorldStreamFilter, from: &World, to: &World) -> Self {
         let from_entities: HashSet<EntityId> = filter.all_entities(from).collect();
         let to_entities: HashSet<EntityId> = filter.all_entities(to).collect();
-        let spawned = to_entities.iter().filter(|id| !from_entities.contains(id)).cloned().collect_vec();
-        let despawned = from_entities.iter().filter(|id| !to_entities.contains(id)).cloned().collect_vec();
-        let in_both = to_entities.iter().filter(|id| from_entities.contains(id)).cloned().collect_vec();
+        let spawned = to_entities
+            .iter()
+            .filter(|id| !from_entities.contains(id))
+            .cloned()
+            .collect_vec();
+        let despawned = from_entities
+            .iter()
+            .filter(|id| !to_entities.contains(id))
+            .cloned()
+            .collect_vec();
+        let in_both = to_entities
+            .iter()
+            .filter(|id| from_entities.contains(id))
+            .cloned()
+            .collect_vec();
 
-        let spawned = spawned.into_iter().map(|id| WorldChange::Spawn(Some(id), filter.read_entity_components(to, id).into()));
-        let despanwed = despawned.into_iter().map(WorldChange::Despawn);
+        let spawned = spawned
+            .into_iter()
+            .map(|id| WorldChange::Spawn(id, filter.read_entity_components(to, id).into()));
+        let despawned = despawned.into_iter().map(WorldChange::Despawn);
         let updated = in_both.into_iter().flat_map(|id| {
-            let from_comps: HashMap<_, _> = filter.get_entity_components(from, id).into_iter().map(|v| (v.index(), v)).collect();
-            let to_comps: HashMap<_, _> = filter.get_entity_components(to, id).into_iter().map(|v| (v.index(), v)).collect();
+            let from_comps: HashMap<_, _> = filter
+                .get_entity_components(from, id)
+                .into_iter()
+                .map(|v| (v.index(), v))
+                .collect();
+            let to_comps: HashMap<_, _> = filter
+                .get_entity_components(to, id)
+                .into_iter()
+                .map(|v| (v.index(), v))
+                .collect();
 
-            let added = to_comps.iter().filter(|c| !from_comps.contains_key(c.0)).map(|v| *v.1).collect_vec();
-            let removed = from_comps.iter().filter(|c| !to_comps.contains_key(c.0)).map(|v| *v.1).collect_vec();
-            let in_both = to_comps.iter().filter(|c| from_comps.contains_key(c.0)).collect_vec();
+            let added = to_comps
+                .iter()
+                .filter(|c| !from_comps.contains_key(c.0))
+                .map(|v| *v.1)
+                .collect_vec();
+            let removed = from_comps
+                .iter()
+                .filter(|c| !to_comps.contains_key(c.0))
+                .map(|v| *v.1)
+                .collect_vec();
+            let in_both = to_comps
+                .iter()
+                .filter(|c| from_comps.contains_key(c.0))
+                .collect_vec();
 
             let changed = in_both
                 .iter()
-                .filter(|&c| from.get_component_content_version(id, *c.0).unwrap() != to.get_component_content_version(id, *c.0).unwrap())
-                .collect_vec();
-
-            let added: Entity = added.iter().map(|&comp| to.get_entry(id, comp).unwrap()).collect();
-
-            let added = if !added.is_empty() { vec![WorldChange::AddComponents(id, added)] } else { vec![] };
-            let removed = if !removed.is_empty() { vec![WorldChange::RemoveComponents(id, removed)] } else { vec![] };
-            let changed = changed
-                .into_iter()
-                .map(|(_, &comp)| {
-                    let entry = to.get_entry(id, comp).unwrap();
-                    WorldChange::Set(id, entry)
+                .filter_map(|&c| {
+                    (from.get_component_content_version(id, *c.0).unwrap()
+                        != to.get_component_content_version(id, *c.0).unwrap())
+                    .then_some(c.1)
                 })
                 .collect_vec();
-            added.into_iter().chain(removed.into_iter()).chain(changed.into_iter())
+
+            let added: Entity = added
+                .iter()
+                .map(|&comp| to.get_entry(id, comp).unwrap())
+                .collect();
+
+            let added = if !added.is_empty() {
+                vec![WorldChange::AddComponents(id, added)]
+            } else {
+                vec![]
+            };
+            let removed = if !removed.is_empty() {
+                vec![WorldChange::RemoveComponents(id, removed)]
+            } else {
+                vec![]
+            };
+            let changed: Entity = changed
+                .into_iter()
+                .map(|&comp| to.get_entry(id, comp).unwrap())
+                .collect();
+            added
+                .into_iter()
+                .chain(removed)
+                .chain(std::iter::once(WorldChange::SetComponents(id, changed)))
         });
 
-        Self { changes: despanwed.chain(spawned).chain(updated).collect_vec() }
+        Self {
+            changes: despawned.chain(spawned).chain(updated).collect_vec(),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.changes.len()
     }
 }
 impl Display for WorldDiff {
@@ -110,6 +174,37 @@ impl Display for WorldDiff {
             write!(f, "...{} more", self.changes.len() - 3).unwrap();
         }
         Ok(())
+    }
+}
+impl<'a> IntoIterator for &'a WorldDiff {
+    type Item = &'a WorldChange;
+
+    type IntoIter = core::slice::Iter<'a, WorldChange>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.changes.iter()
+    }
+}
+
+/// Immutable version of WorldDiff, cheap to clone
+#[derive(Serialize, Clone, Debug)]
+pub struct FrozenWorldDiff {
+    changes: Arc<[WorldChange]>,
+}
+impl From<WorldDiff> for FrozenWorldDiff {
+    fn from(diff: WorldDiff) -> Self {
+        Self {
+            changes: diff.changes.into(),
+        }
+    }
+}
+impl<'a> IntoIterator for &'a FrozenWorldDiff {
+    type Item = &'a WorldChange;
+
+    type IntoIter = std::slice::Iter<'a, WorldChange>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.changes.iter()
     }
 }
 
@@ -132,18 +227,24 @@ impl WorldStreamFilter {
         arch_filter: ArchetypeFilter,
         component_filter: Arc<dyn Fn(ComponentDesc, WorldStreamCompEvent) -> bool + Sync + Send>,
     ) -> Self {
-        Self { arch_filter, component_filter }
+        Self {
+            arch_filter,
+            component_filter,
+        }
     }
     pub fn initial_diff(&self, world: &World) -> WorldDiff {
         WorldDiff {
             changes: self
                 .all_entities(world)
-                .map(|id| WorldChange::Spawn(Some(id), self.read_entity_components(world, id).into()))
+                .map(|id| WorldChange::Spawn(id, self.read_entity_components(world, id).into()))
                 .collect_vec(),
         }
     }
     pub fn all_entities<'a>(&self, world: &'a World) -> impl Iterator<Item = EntityId> + 'a {
-        Query::all().filter(&self.arch_filter).iter(world, None).map(|x| x.id())
+        Query::all()
+            .filter(&self.arch_filter)
+            .iter(world, None)
+            .map(|x| x.id())
     }
     pub fn get_entity_components(&self, world: &World, id: EntityId) -> Vec<ComponentDesc> {
         world
@@ -154,111 +255,74 @@ impl WorldStreamFilter {
             .collect_vec()
     }
     fn read_entity_components(&self, world: &World, id: EntityId) -> Vec<ComponentEntry> {
-        self.get_entity_components(world, id).into_iter().map(|comp| world.get_entry(id, comp).unwrap()).collect_vec()
+        self.get_entity_components(world, id)
+            .into_iter()
+            .map(|comp| world.get_entry(id, comp).unwrap())
+            .collect_vec()
     }
 }
 impl Default for WorldStreamFilter {
     fn default() -> Self {
-        Self { arch_filter: Default::default(), component_filter: Arc::new(|_, _| true) }
+        Self {
+            arch_filter: Default::default(),
+            component_filter: Arc::new(|_, _| true),
+        }
     }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum WorldChange {
-    Spawn(Option<EntityId>, Entity),
+    Spawn(EntityId, Entity),
     Despawn(EntityId),
     AddComponents(EntityId, Entity),
     RemoveComponents(EntityId, Vec<ComponentDesc>),
-    Set(EntityId, ComponentEntry),
+    SetComponents(EntityId, Entity),
 }
 
 impl WorldChange {
     pub fn is_set(&self) -> bool {
-        matches!(self, Self::Set(_, _))
+        matches!(self, Self::SetComponents(_, _))
     }
 
     pub fn is_remove_components(&self) -> bool {
         matches!(self, Self::RemoveComponents(_, _))
     }
 
-    fn apply(self, world: &mut World, spanwed_extra_data: &Entity, panic_on_error: bool, create_revert: bool) -> Option<Self> {
+    fn apply(self, world: &mut World, spawned_extra_data: &Entity, panic_on_error: bool) {
         match self {
             Self::Spawn(id, data) => {
-                if let Some(id) = id {
-                    if !world.spawn_with_id(id, data.with_merge(spanwed_extra_data.clone())) {
-                        if panic_on_error {
-                            panic!("WorldChange::apply spawn_mirror entity already exists: {id:?}");
-                        } else {
-                            log::error!("WorldChange::apply spawn_mirror entity already exists: {id:?}");
-                        }
-                    }
-                    if create_revert {
-                        return Some(Self::Despawn(id));
-                    }
-                } else {
-                    let id = world.spawn(data.with_merge(spanwed_extra_data.clone()));
-                    if create_revert {
-                        return Some(Self::Despawn(id));
+                if !world.spawn_with_id(id, data.with_merge(spawned_extra_data.clone())) {
+                    if panic_on_error {
+                        panic!("WorldChange::apply spawn_mirror entity already exists: {id:?}");
+                    } else {
+                        tracing::error!(
+                            "WorldChange::apply spawn_mirror entity already exists: {id:?}"
+                        );
                     }
                 }
             }
             Self::Despawn(id) => {
-                let res = if create_revert {
-                    world.get_components(id).ok().map(|components| {
-                        let mut ed = Entity::new();
-                        for comp in components {
-                            // Only serializable components
-                            if comp.has_attribute::<Serializable>() {
-                                ed.set_entry(world.get_entry(id, comp).unwrap());
-                            }
-                        }
-                        Self::Spawn(Some(id), ed)
-                    })
-                } else {
-                    None
-                };
                 world.despawn(id);
-                return res;
             }
             Self::AddComponents(id, data) => {
-                let res = if create_revert { Some(Self::RemoveComponents(id, data.components())) } else { None };
                 world.add_components(id, data).unwrap();
-                return res;
             }
             Self::RemoveComponents(id, comps) => {
-                let res = if create_revert {
-                    Some(Self::AddComponents(id, comps.iter().filter_map(|&comp| world.get_entry(id, comp).ok()).collect()))
-                } else {
-                    None
-                };
-                for comp in comps {
-                    world.remove_component(id, comp).unwrap();
-                }
-                return res;
+                world.remove_components(id, comps).unwrap();
             }
-            Self::Set(id, entry) => {
-                // let prev = match entry.set_at_entity(world, id) {
-                let prev = match world.set_entry(id, entry) {
-                    Ok(entry) => entry,
-                    Err(err) => {
-                        if panic_on_error {
-                            panic!("Failed to set: {err:?}");
-                        } else {
-                            return None;
-                        }
+            Self::SetComponents(id, data) => {
+                if let Err(err) = world.set_components(id, data) {
+                    if panic_on_error {
+                        panic!("Failed to set: {err:?}");
                     }
                 };
-                if create_revert {
-                    return Some(Self::Set(id, prev));
-                }
             }
         }
-        None
     }
     fn filter(&self, world: &World, filter: &WorldStreamFilter) -> Option<Self> {
         match self {
             Self::Spawn(id, data) => {
-                if !filter.arch_filter.matches_entity(world, (*id).unwrap()) {
+                if !filter.arch_filter.matches_entity(world, *id) {
                     return None;
                 }
                 let mut data = data.clone();
@@ -275,7 +339,12 @@ impl WorldChange {
                     return None;
                 }
                 let mut data = data.clone();
-                data.filter(&|comp| (filter.component_filter)(comp, WorldStreamCompEvent::AddComponent));
+                data.filter(&|comp| {
+                    (filter.component_filter)(comp, WorldStreamCompEvent::AddComponent)
+                });
+                if data.is_empty() {
+                    return None;
+                }
                 Some(Self::AddComponents(*id, data.clone()))
             }
             Self::RemoveComponents(id, comps) => {
@@ -286,30 +355,31 @@ impl WorldChange {
                     *id,
                     comps
                         .iter()
-                        .filter_map(
-                            |&comp| {
-                                if (filter.component_filter)(comp, WorldStreamCompEvent::RemoveComponent) {
-                                    Some(comp)
-                                } else {
-                                    None
-                                }
-                            },
-                        )
+                        .filter_map(|&comp| {
+                            if (filter.component_filter)(
+                                comp,
+                                WorldStreamCompEvent::RemoveComponent,
+                            ) {
+                                Some(comp)
+                            } else {
+                                None
+                            }
+                        })
                         .collect_vec(),
                 ))
             }
-            Self::Set(_id, _entry) => Some(self.clone()),
+            Self::SetComponents(_, _) => Some(self.clone()),
         }
     }
 }
 impl Display for WorldChange {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            WorldChange::Spawn(id, data) => write!(f, "spawn({}, {})", id.unwrap_or(EntityId::null()), data.len()),
+            WorldChange::Spawn(id, data) => write!(f, "spawn({}, {})", id, data.len()),
             WorldChange::Despawn(id) => write!(f, "despawn({id})"),
             WorldChange::AddComponents(id, data) => write!(f, "add_components({id}, {data:?})"),
             WorldChange::RemoveComponents(id, _) => write!(f, "remove_components({id})"),
-            WorldChange::Set(id, data) => write!(f, "set({id}, {data:?})"),
+            WorldChange::SetComponents(id, data) => write!(f, "set({id}, {data:?})"),
         }
     }
 }
@@ -323,31 +393,77 @@ pub struct WorldStream {
 }
 impl WorldStream {
     pub fn new(filter: WorldStreamFilter) -> Self {
-        Self { changed_qs: QueryState::new(), shape_stream_reader: FramedEventsReader::new(), filter, version: 0 }
+        Self {
+            changed_qs: QueryState::new(),
+            shape_stream_reader: FramedEventsReader::new(),
+            filter,
+            version: 0,
+        }
     }
     pub fn filter(&self) -> &WorldStreamFilter {
         &self.filter
     }
     #[profiling::function]
     pub fn next_diff(&mut self, world: &World) -> WorldDiff {
+        // get all shape changes (spawn/despawn/add/remove components)
         let shape_changes = self
             .shape_stream_reader
             .iter(world.shape_change_events.as_ref().unwrap())
             .filter_map(|(_, change)| change.filter(world, &self.filter))
             .collect_vec();
 
+        // prepare a list of entities/components that were removed so we don't create Set operations for them
+        let mut removed_entities = HashSet::new();
+        let mut removed_components = HashSet::new();
+        for change in shape_changes.iter() {
+            match change {
+                WorldChange::Spawn(id, _) => {
+                    removed_entities.remove(id);
+                }
+                WorldChange::Despawn(id) => {
+                    removed_entities.insert(*id);
+                }
+                WorldChange::AddComponents(id, comps) => {
+                    for entry in comps.iter() {
+                        removed_components.remove(&(*id, entry.desc()));
+                    }
+                }
+                WorldChange::RemoveComponents(id, comps) => {
+                    removed_components.extend(comps.iter().map(|&desc| (*id, desc)));
+                }
+                _ => {}
+            }
+        }
+
+        // get all Set operations
         let mut sets = HashMap::new();
         for arch in world.archetypes.iter() {
             if self.filter.arch_filter.matches(&arch.active_components) {
                 for arch_comp in arch.components.iter() {
-                    if (self.filter.component_filter)(arch_comp.component, WorldStreamCompEvent::Set) {
-                        let reader = self.changed_qs.get_change_reader(arch.id, arch_comp.component.index() as _);
+                    if (self.filter.component_filter)(
+                        arch_comp.component,
+                        WorldStreamCompEvent::Set,
+                    ) {
+                        let reader = self
+                            .changed_qs
+                            .change_readers
+                            .get(arch.id, arch_comp.component.index() as _);
 
                         for (_, &entity_id) in reader.iter(&*arch_comp.changes.borrow()) {
+                            if removed_entities.contains(&entity_id) {
+                                // don't create Set operation if the entity was removed
+                                continue;
+                            }
                             if let Some(loc) = world.entity_loc(entity_id) {
-                                if loc.archetype == arch.id && arch_comp.get_content_version(loc.index) > self.version {
-                                    let entry = sets.entry(entity_id).or_insert_with(Vec::new);
-                                    entry.push(world.get_entry(entity_id, arch_comp.component).unwrap());
+                                if loc.archetype == arch.id
+                                    && arch_comp.get_content_version(loc.index) > self.version
+                                    && !removed_components
+                                        .contains(&(entity_id, arch_comp.component))
+                                {
+                                    let entry = sets.entry(entity_id).or_insert_with(Entity::new);
+                                    entry.set_entry(
+                                        world.get_entry(entity_id, arch_comp.component).unwrap(),
+                                    );
                                 }
                             }
                         }
@@ -357,7 +473,10 @@ impl WorldStream {
         }
         self.version = world.version();
         let mut changes = shape_changes;
-        changes.extend(sets.into_iter().flat_map(|(id, entrys)| entrys.into_iter().map(move |entry| WorldChange::Set(id, entry))));
+        changes.extend(
+            sets.into_iter()
+                .map(|(id, entity)| WorldChange::SetComponents(id, entity)),
+        );
         WorldDiff { changes }
     }
 }

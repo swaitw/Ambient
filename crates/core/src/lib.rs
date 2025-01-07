@@ -1,30 +1,43 @@
-#[macro_use]
-extern crate lazy_static;
-
-use ambient_sys::{task::RuntimeHandle, time::Instant, time::SystemTime};
+use ambient_sys::{
+    task::RuntimeHandle,
+    time::{Instant, SystemTime},
+};
 use chrono::{DateTime, Utc};
+use hierarchy::despawn_recursive;
 use std::{sync::Arc, time::Duration};
 
-use ambient_ecs::{components, query, Debuggable, Description, DynSystem, FrameEvent, Name, Networked, Resource, Store, System, World};
+use ambient_ecs::{
+    components, generated::hierarchy::components::parent, query, Debuggable, Description,
+    DynSystem, Entity, FrameEvent, Name, Networked, Resource, Store, System, World,
+};
 use ambient_gpu::{gpu::Gpu, mesh_buffer::GpuMesh};
 
-use ambient_std::asset_cache::{AssetCache, SyncAssetKey};
-pub use paste;
+use ambient_native_std::asset_cache::{AssetCache, SyncAssetKey};
+
 use serde::{Deserialize, Serialize};
-use winit::window::Window;
 
 pub mod async_ecs;
 pub mod bounding;
 pub mod camera;
-pub mod gpu_ecs;
+
 pub mod hierarchy;
 pub mod player;
+pub mod timing;
 pub mod transform;
 pub mod window;
 
+pub use ambient_ecs::generated::{
+    app::components::{
+        delta_time, description, epoch_time, game_time, main_package_name, main_scene, map_seed,
+        name, ref_count, selectable, snap_to_ground, tags, ui_scene,
+    },
+    ecs::components::remove_at_game_time,
+};
+
+/// The time between fixed updates of the server state.
+pub const FIXED_SERVER_TICK_TIME: Duration = Duration::from_micros((1_000_000. / 60.) as u64);
+
 components!("app", {
-    @[Debuggable, Networked, Store, Name["Name"], Description["A human-friendly name for this entity."]]
-    name: String,
     @[Resource]
     runtime: RuntimeHandle,
     @[Resource]
@@ -32,84 +45,41 @@ components!("app", {
     @[Debuggable]
     mesh: Arc<GpuMesh>,
 
-    @[
-        Debuggable, Networked, Store,
-        Name["Main scene"],
-        Description["If attached, this entity belongs to the main scene."]
-    ]
-    main_scene: (),
-    @[
-        Debuggable, Networked, Store,
-        Name["UI scene"],
-        Description["If attached, this entity belongs to the UI scene."]
-    ]
-    ui_scene: (),
     @[Resource]
     asset_cache: AssetCache,
-    @[
-        Debuggable, Networked, Store,
-        Name["Map seed"],
-        Description["A random number seed for this map."]
-    ]
-    map_seed: u64,
-    @[
-        Debuggable, Networked, Store,
-        Name["Snap to ground"],
-        Description["This object should automatically be moved with the terrain if the terrain is changed.\nThe value is the offset from the terrain."]
-    ]
-    snap_to_ground: f32,
-    @[
-        Debuggable, Networked, Store,
-        Name["Selectable"],
-        Description["If attached, this object can be selected in the editor."]
-    ]
-    selectable: (),
     @[
         Debuggable, Networked, Store, Resource,
         Name["Session start time"],
         Description["When the current server session was started."]
     ]
     session_start: DateTime<Utc>,
-    @[
-        Debuggable, Networked, Store,
-        Name["Tags"],
-        Description["Tags for categorizing this entity."]
-    ]
-    tags: Vec<String>,
     @[Debuggable, Networked, Store]
     game_mode: GameMode,
 
     @[Resource, Debuggable]
-    time: Duration,
-    @[Resource, Debuggable, Name["Delta Time"], Description["How long the previous tick took in seconds.\nAlso known as frametime."]]
-    dtime: f32,
+    app_start_time: Instant,
     @[Resource, Debuggable]
-    app_start_time: Duration,
+    last_frame_time: Instant,
     @[Resource, Debuggable]
     frame_index: usize,
-    @[Debuggable, Store]
-    remove_at_time: Duration,
 
-    /// Generic component that indicates the entity shouldn't be sent over network
-    @[Debuggable, Networked, Store]
-    no_sync: (),
-
-    @[
-        Resource, Debuggable,
-        Name["Project Name"],
-        Description["The name of the project, from the manifest.\nDefaults to \"Ambient\"."]
-    ]
-    project_name: String,
+    @[Resource]
+    performance_samples: Vec<PerformanceSample>,
 });
+
+#[derive(Debug, Clone)]
+pub struct PerformanceSample {
+    pub frame_time: Duration,
+    pub external_time: Duration,
+}
 
 pub fn init_all_components() {
     init_components();
-    player::init_components();
     window::init_components();
-    hierarchy::init_components();
     async_ecs::init_components();
-    gpu_ecs::init_components();
+    ambient_gpu_ecs::init_components();
     camera::init_components();
+    timing::init_components();
     transform::init_components();
     transform::init_gpu_components();
     bounding::init_components();
@@ -122,18 +92,64 @@ impl SyncAssetKey<RuntimeHandle> for RuntimeKey {}
 
 #[derive(Debug, Clone)]
 pub struct WindowKey;
+
 #[cfg(not(target_os = "unknown"))]
-impl SyncAssetKey<Arc<Window>> for WindowKey {}
+impl SyncAssetKey<Arc<winit::window::Window>> for WindowKey {}
 
 pub fn remove_at_time_system() -> DynSystem {
-    query((remove_at_time(),)).to_system(|q, world, qs, _| {
-        let time = *world.resource(self::time());
+    query((remove_at_game_time(),)).to_system(|q, world, qs, _| {
+        let game_time = *world.resource(self::game_time());
         for (id, (remove_at_time,)) in q.collect_cloned(world, qs) {
-            if time >= remove_at_time {
+            if game_time >= remove_at_time {
                 world.despawn(id);
             }
         }
     })
+}
+pub fn refcount_system() -> DynSystem {
+    query(ref_count().changed())
+        .excl(parent())
+        .to_system(|q, world, qs, _| {
+            for (id, count) in q.collect_cloned(world, qs) {
+                if count == 0 {
+                    despawn_recursive(world, id);
+                }
+            }
+        })
+}
+
+/// Returns all the time-related components that need to be
+/// created at startup time.
+pub fn time_resources_start(delta_time: Duration) -> Entity {
+    let system_now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap();
+
+    let instant_now = Instant::now();
+
+    Entity::new()
+        .with(self::app_start_time(), instant_now)
+        .with(self::epoch_time(), system_now)
+        .with(self::game_time(), Duration::ZERO)
+        .with(self::last_frame_time(), instant_now)
+        .with(self::delta_time(), delta_time.as_secs_f32())
+}
+
+// Returns all the time-related components that update every frame.
+pub fn time_resources_frame(
+    frame_time: Instant,
+    app_start_time: Instant,
+    delta_time: Duration,
+) -> Entity {
+    let epoch_time = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap();
+
+    Entity::new()
+        .with(self::last_frame_time(), frame_time)
+        .with(self::epoch_time(), epoch_time)
+        .with(self::game_time(), frame_time - app_start_time)
+        .with(self::delta_time(), delta_time.as_secs_f32())
 }
 
 #[derive(Debug)]
@@ -144,14 +160,18 @@ pub struct FixedTimestepSystem {
 }
 impl FixedTimestepSystem {
     pub fn new(timestep: f32, system: DynSystem) -> Self {
-        Self { system, timestep, acc: 0. }
+        Self {
+            system,
+            timestep,
+            acc: 0.,
+        }
     }
 }
 impl System for FixedTimestepSystem {
     #[profiling::function]
     fn run(&mut self, world: &mut World, event: &FrameEvent) {
-        let dtime = *world.resource(self::dtime());
-        self.acc += dtime;
+        let delta_time = *world.resource(self::delta_time());
+        self.acc += delta_time;
         while self.acc >= self.timestep {
             self.acc -= self.timestep;
             self.system.run(world, event);
@@ -160,26 +180,45 @@ impl System for FixedTimestepSystem {
 }
 
 #[derive(Debug)]
-pub struct TimeResourcesSystem {
+pub struct ClientTimeResourcesSystem {
     frame_time: Instant,
 }
-impl TimeResourcesSystem {
+impl ClientTimeResourcesSystem {
     pub fn new() -> Self {
-        Self { frame_time: Instant::now() }
+        Self {
+            frame_time: Instant::now(),
+        }
     }
 }
-impl System for TimeResourcesSystem {
+impl System for ClientTimeResourcesSystem {
     fn run(&mut self, world: &mut World, _event: &FrameEvent) {
-        let dtime = self.frame_time.elapsed().as_secs_f32();
+        let delta_time = self.frame_time.elapsed();
         self.frame_time = Instant::now();
-        let time = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap();
-        world.set(world.resource_entity(), self::time(), time).unwrap();
-        world.set(world.resource_entity(), self::dtime(), dtime).unwrap();
-        world.set(world.resource_entity(), frame_index(), world.resource(frame_index()) + 1).unwrap();
+
+        world
+            .set_components(
+                world.resource_entity(),
+                time_resources_frame(
+                    self.frame_time,
+                    *world.resource(self::app_start_time()),
+                    delta_time,
+                ),
+            )
+            .unwrap();
+
+        world
+            .set(
+                world.resource_entity(),
+                frame_index(),
+                world.resource(frame_index()) + 1,
+            )
+            .unwrap();
     }
 }
 
-#[derive(Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Debug, Hash, Default)]
+#[derive(
+    Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Debug, Hash, Default,
+)]
 pub enum GameMode {
     #[default]
     Edit,

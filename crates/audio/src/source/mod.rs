@@ -5,8 +5,10 @@ pub(crate) mod dynamic_delay;
 pub mod gain;
 pub mod history;
 mod mix;
+mod onepole;
 mod oscilloscope;
 mod pad_to;
+mod pan;
 mod peek;
 mod repeat;
 mod sample_bufferer;
@@ -16,7 +18,12 @@ mod spatial;
 pub mod streaming_source;
 mod uniform;
 use std::{
-    self, f32::consts::TAU, fmt::Debug, ops::{Deref, DerefMut, RangeBounds}, sync::Arc, time::Duration
+    self,
+    f32::consts::TAU,
+    fmt::Debug,
+    ops::{Deref, DerefMut, RangeBounds},
+    sync::Arc,
+    time::Duration,
 };
 
 pub use buffered::*;
@@ -25,6 +32,8 @@ use circular_queue::CircularQueue;
 pub use crossfade::*;
 pub use gain::*;
 pub use mix::*;
+pub use onepole::*;
+pub use pan::*;
 use parking_lot::Mutex;
 pub use peek::*;
 pub use repeat::*;
@@ -33,10 +42,29 @@ pub use slice::*;
 pub use spatial::*;
 pub use uniform::*;
 
-use self::{history::History, mix::Mix, oscilloscope::Oscilloscope, pad_to::PadTo};
+use self::{history::History, oscilloscope::Oscilloscope, pad_to::PadTo};
 use crate::{
-    blt::{BilinearTransform, Hpf, Lpf, TransferFunction}, hrtf::HrtfLib, value::{Constant, Value}, AudioEmitter, AudioListener, Frame, SampleRate
+    blt::*,
+    hrtf::HrtfLib,
+    value::{Constant, Value},
+    AudioEmitter, AudioListener, Frame, SampleRate,
 };
+
+pub trait Param: Clone {
+    fn get_value(&self) -> f32;
+}
+
+impl Param for f32 {
+    fn get_value(&self) -> f32 {
+        *self
+    }
+}
+
+impl Param for Arc<Mutex<f32>> {
+    fn get_value(&self) -> f32 {
+        *self.lock()
+    }
+}
 
 /// A source represents a continuous stream of stereo audio samples.
 ///
@@ -146,11 +174,20 @@ pub trait Source: Send {
         SampleIter::new(self)
     }
 
-    fn gain(self, gain: f32) -> Gain<Self>
+    fn gain<G>(self, gain: G) -> Box<dyn Source + Send>
     where
-        Self: Sized,
+        Self: Sized + 'static,
+        G: GainValue + Send + 'static,
     {
-        Gain::new(self, gain)
+        Box::new(Gain::new(self, gain))
+    }
+
+    fn pan<P>(self, pan: P) -> Box<dyn Source + Send>
+    where
+        Self: Sized + 'static,
+        P: PanValue + Send + 'static,
+    {
+        Box::new(Pan::new(self, pan))
     }
 
     fn spatial<L, P>(self, hrtf_lib: &HrtfLib, listener: L, params: P) -> Spatial<Self, L, P>
@@ -174,6 +211,14 @@ pub trait Source: Send {
         Self: Sized,
     {
         BilinearTransform::new(self, Constant(Lpf { freq, bandwidth }))
+    }
+
+    fn onepole<P>(self, freq: P) -> Box<dyn Source + Send>
+    where
+        Self: Sized + 'static,
+        P: Param + Send + 'static,
+    {
+        Box::new(OnePole::new(self, freq))
     }
 
     fn blt<V, H>(self, transfer: V) -> BilinearTransform<Self, H, V>
@@ -219,26 +264,38 @@ where
         self.deref().sample_count()
     }
 }
-
 const DEFAULT_HZ: SampleRate = 44100;
 
 #[derive(Debug, Clone)]
 pub struct SineWave {
     freq: f32,
-    cursor: usize,
+    phase: f32,
+    sr: SampleRate,
 }
 
 impl SineWave {
     pub fn new(freq: f32) -> Self {
-        Self { freq, cursor: 0 }
+        Self {
+            freq,
+            phase: 0.0,
+            sr: DEFAULT_HZ,
+        }
+    }
+    pub fn phase(mut self, phase: f32) -> Self {
+        self.phase = phase;
+        self
+    }
+
+    pub fn sr(mut self, sr: SampleRate) -> Self {
+        self.sr = sr;
+        self
     }
 }
 
 impl Source for SineWave {
     fn next_sample(&mut self) -> Option<Frame> {
-        let t = self.freq * self.cursor as f32 * TAU / DEFAULT_HZ as f32;
-        let v = t.sin();
-        self.cursor += 1;
+        self.phase += TAU * self.freq / DEFAULT_HZ as f32;
+        let v = self.phase.sin();
         Some(Frame::splat(v))
     }
 

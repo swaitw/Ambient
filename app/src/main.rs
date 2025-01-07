@@ -1,7 +1,9 @@
-use ambient_std::{
+use ambient_native_std::{
     asset_cache::{AssetCache, SyncAssetKeyExt},
+    asset_url::{ContentBaseUrlKey, UsingLocalDebugAssetsKey},
     download_asset::AssetsCacheOnDisk,
 };
+use ambient_settings::SettingsKey;
 use clap::Parser;
 
 mod cli;
@@ -11,196 +13,234 @@ mod shared;
 
 use ambient_physics::physx::PhysicsKey;
 use anyhow::Context;
-use cli::Cli;
-use log::LevelFilter;
-use server::QUIC_INTERFACE_PORT;
+use cli::{Cli, Commands};
+use serde::Deserialize;
+use std::path::Path;
+use tracing_subscriber::{filter::LevelFilter, registry, EnvFilter};
+
+fn main() -> anyhow::Result<()> {
+    let rt = ambient_sys::task::make_native_multithreaded_runtime()?;
+
+    setup_logging()?;
+
+    ambient_git_rev_init::init().expect("Should be called exactly once");
+
+    shared::components::init()?;
+
+    let runtime = rt.handle();
+    let assets = AssetCache::new(runtime.clone());
+    let _settings = SettingsKey.get(&assets);
+
+    // _guard and _handle need to be kept around for the lifetime of the application
+    let _guard: sentry::ClientInitGuard;
+    let _handle: Result<sentry_rust_minidump::ClientHandle, sentry_rust_minidump::Error>;
+    #[cfg(feature = "production")]
+    if _settings.general.sentry.enabled {
+        let sentry_dsn = _settings.general.sentry.dsn;
+        _guard = init_sentry(&sentry_dsn);
+        _handle = sentry_rust_minidump::init(&_guard);
+        match _handle {
+            Ok(_) => tracing::debug!("Initialized Sentry with DSN: {:?}", sentry_dsn),
+            Err(err) => tracing::warn!("Failed to initialize Sentry: {:?}", err),
+        }
+    }
+
+    PhysicsKey.get(&assets); // Load physics
+    AssetsCacheOnDisk.insert(&assets, false); // Disable disk caching for now; see https://github.com/AmbientRun/Ambient/issues/81
+
+    let cli = if let Some(launch_json) = LaunchJson::load()? {
+        Cli::parse_from(launch_json.args())
+    } else {
+        Cli::parse()
+    };
+
+    if let Some(package) = cli.package() {
+        if package.project {
+            tracing::warn!("`-p`/`--project` has no semantic meaning.");
+            tracing::warn!("You do not need to use `-p`/`--project` - `ambient run project` is the same as `ambient run -p project`.");
+        }
+    }
+
+    // Update some ~~global variables~~ asset keys with package-path derived state
+    let use_release_build = cli.use_release_build();
+    if let Some(package_path) = cli.package().map(|p| p.package_path()).transpose()? {
+        if package_path.is_remote() {
+            // package path is a URL, so let's use it as the content base URL
+            ContentBaseUrlKey.insert(&assets, package_path.url.clone());
+        }
+
+        // Store a flag that we are using local debug assets
+        // Used for emitting warnings when local debug assets are sent to remote clients
+        UsingLocalDebugAssetsKey.insert(&assets, !package_path.is_remote() && !use_release_build);
+    }
+
+    match &cli.command {
+        // package commands
+        Commands::Package { package } => cli::package::handle(package, &rt, assets),
+        Commands::New(args) => rt
+            .block_on(cli::package::new::handle(args, &assets))
+            .context("Failed to create package"),
+        Commands::Build(build) => rt.block_on(async {
+            cli::package::build::handle(build, &assets, use_release_build)
+                .await
+                .map(|_| ())
+        }),
+        Commands::Deploy(deploy) => rt.block_on(cli::package::deploy::handle(
+            deploy,
+            &assets,
+            use_release_build,
+        )),
+        Commands::Serve(serve) => rt.block_on(async {
+            Ok(
+                cli::package::serve::handle(serve, assets, use_release_build)
+                    .await?
+                    .join()
+                    .await?,
+            )
+        }),
+        Commands::Run(run) => cli::package::run::handle(&rt, run, assets, use_release_build),
+
+        // non-package commands
+        Commands::Assets { assets: command } => rt.block_on(cli::assets::handle(command, &assets)),
+        Commands::Login => rt.block_on(cli::login::handle(&assets)),
+        Commands::Join(join) => cli::join::handle(join, &rt, assets),
+    }
+}
+
+#[derive(Deserialize)]
+struct LaunchJson {
+    args: Vec<String>,
+}
+impl LaunchJson {
+    fn load() -> anyhow::Result<Option<Self>> {
+        if std::env::args().len() > 1 {
+            return Ok(None);
+        }
+        let mut launch_file = Path::new("launch.json").to_path_buf();
+        if !launch_file.exists() {
+            launch_file = std::env::current_dir()?.join("launch.json");
+        }
+        if !launch_file.exists() {
+            if let Some(parent) = std::env::current_exe()?.parent() {
+                launch_file = parent.join("launch.json");
+            }
+        }
+        if !launch_file.exists() {
+            return Ok(None);
+        }
+        tracing::info!("Using launch.json for CLI args: {}", launch_file.display());
+        let launch_json =
+            std::fs::read_to_string(launch_file).context("Failed to read launch.json")?;
+        let launch_json: Self =
+            serde_json::from_str(&launch_json).context("Failed to parse launch.json")?;
+        Ok(Some(launch_json))
+    }
+    fn args(&self) -> Vec<String> {
+        let mut args = std::env::args().collect::<Vec<_>>();
+        [args.pop().unwrap()]
+            .into_iter()
+            .chain(self.args.iter().cloned())
+            .collect()
+    }
+}
 
 fn setup_logging() -> anyhow::Result<()> {
+    // This fixes the `<unknown time>` in log formatting, an alternative is to use UTC time
+    unsafe { time::util::local_offset::set_soundness(time::util::local_offset::Soundness::Unsound) }
+
+    /// Create a layer of filtering before to remove info statements from external crates
+    ///
+    /// In general, `info` level logs should not be used in libraries as they are user facing and are recommended to be `debug` or `trace` events instead.
     const MODULES: &[(LevelFilter, &[&str])] = &[
         (
-            LevelFilter::Error,
+            LevelFilter::ERROR,
             &[
                 // Warns about extra syntactic elements; we are not concerned with these.
                 "fbxcel",
             ],
         ),
         (
-            LevelFilter::Warn,
+            LevelFilter::WARN,
             &[
-                "ambient_build",
-                "ambient_gpu",
-                "ambient_model",
-                "ambient_physics",
-                "ambient_std",
                 "cranelift_codegen",
                 "naga",
                 "tracing",
+                "symphonia_core",
+                "symphonia_bundle_mp3",
+                // TODO: remove, fixed in later wgpu version in https://github.com/gfx-rs/wgpu/commit/4478c52debcab1b88b80756b197dc10ece90dec9
                 "wgpu_core",
                 "wgpu_hal",
+                "symphonia_format_wav",
             ],
         ),
     ];
 
-    // Initialize the logger and lower the log level for modules we don't need to hear from by default.
-    #[cfg(not(feature = "tracing"))]
-    {
-        let mut builder = env_logger::builder();
-        builder.filter_level(LevelFilter::Info);
+    use tracing::metadata::Level;
+    use tracing_subscriber::prelude::*;
 
-        for (level, modules) in MODULES {
-            for module in *modules {
-                builder.filter_module(module, *level);
-            }
+    let mut targets = tracing_subscriber::filter::Targets::new()
+        .with_default(tracing::metadata::LevelFilter::DEBUG);
+    for (level, modules) in MODULES {
+        for &module in *modules {
+            targets = targets.with_target(module, *level);
         }
-
-        builder.parse_default_env().try_init()?;
-
-        Ok(())
     }
 
-    #[cfg(feature = "tracing")]
-    {
-        use tracing::metadata::Level;
-        use tracing_log::AsTrace;
-        use tracing_subscriber::prelude::*;
-        use tracing_subscriber::{registry, EnvFilter};
+    let env_filter = EnvFilter::builder()
+        .with_default_directive(Level::INFO.into())
+        .from_env_lossy();
 
-        let mut filter = tracing_subscriber::filter::Targets::new().with_default(tracing::metadata::LevelFilter::DEBUG);
-        for (level, modules) in MODULES {
-            for &module in *modules {
-                filter = filter.with_target(module, level.as_trace());
-            }
-        }
+    let registry = registry().with(targets).with(env_filter);
 
-        // BLOCKING: pending https://github.com/tokio-rs/tracing/issues/2507
-        // let modules: Vec<_> = MODULES.iter().flat_map(|&(level, modules)| modules.iter().map(move |&v| format!("{v}={level}"))).collect();
-
-        // eprintln!("{modules:#?}");
-        // let mut filter = tracing_subscriber::filter::EnvFilter::builder().with_default_directive(Level::INFO.into()).from_env_lossy();
-
-        // for module in modules {
-        //     filter = filter.add_directive(module.parse().unwrap());
-        // }
-
-        // let mut filter = std::env::var("RUST_LOG").unwrap_or_default().parse::<tracing_subscriber::filter::Targets>().unwrap_or_default();
-        // filter.extend(MODULES.iter().flat_map(|&(level, modules)| modules.iter().map(move |&v| (v, level.as_trace()))));
-
-        let env_filter = EnvFilter::builder().with_default_directive(Level::INFO.into()).from_env_lossy();
-
-        registry()
-            .with(filter)
-            .with(env_filter)
-            //
-            .with(tracing_tree::HierarchicalLayer::new(4).with_indent_lines(true).with_verbose_entry(true).with_verbose_exit(true))
-            // .with(tracing_subscriber::fmt::Layer::new().pretty())
+    // use stackdriver format if available and requested
+    #[cfg(feature = "stackdriver")]
+    if std::env::var("LOG_FORMAT").unwrap_or_default() == "stackdriver" {
+        registry
+            .with(tracing_stackdriver::layer().with_writer(std::io::stdout))
             .try_init()?;
-
-        Ok(())
+        return Ok(());
     }
+
+    #[cfg(not(feature = "tracing-tree"))]
+    let format_layer = tracing_subscriber::fmt::Layer::new().compact().with_timer(
+        tracing_subscriber::fmt::time::LocalTime::new(
+            time::format_description::parse("[hour]:[minute]:[second]")
+                .expect("format string should be valid!"),
+        ),
+    );
+
+    #[cfg(feature = "tracing-tree")]
+    let format_layer = tracing_tree::HierarchicalLayer::default()
+        .with_targets(false)
+        .with_indent_lines(true)
+        .with_span_retrace(true)
+        .with_deferred_spans(true);
+
+    // otherwise use the default format
+    registry.with(format_layer).try_init()?;
+
+    Ok(())
 }
 
-fn main() -> anyhow::Result<()> {
-    setup_logging()?;
+#[cfg(feature = "production")]
+fn init_sentry(sentry_dsn: &String) -> sentry::ClientInitGuard {
+    std::env::set_var("RUST_BACKTRACE", "1"); // This is needed for anyhow errors captured by sentry to get backtraces
 
-    shared::components::init()?;
-    let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
-    let assets = AssetCache::new(runtime.handle().clone());
-    PhysicsKey.get(&assets); // Load physics
-    AssetsCacheOnDisk.insert(&assets, false); // Disable disk caching for now; see https://github.com/AmbientRun/Ambient/issues/81
+    // https://stackoverflow.com/questions/66790155/what-is-the-recommended-way-to-propagate-panics-in-rust-tokio-code
+    // The "sentry" panic handler will call this
+    // This is instead of using panic=abort, which doesn't work with workspace projects: https://github.com/rust-lang/cargo/issues/8264
+    let default_panic = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        default_panic(info);
+        std::process::exit(1);
+    }));
 
-    let cli = Cli::parse();
-
-    let current_dir = std::env::current_dir()?;
-    let project_path = cli.project().and_then(|p| p.path.clone()).unwrap_or_else(|| current_dir.clone());
-    let project_path =
-        if project_path.is_absolute() { project_path } else { ambient_std::path::normalize(&current_dir.join(project_path)) };
-
-    if project_path.exists() && !project_path.is_dir() {
-        anyhow::bail!("Project path {project_path:?} exists and is not a directory.");
-    }
-
-    // If new: create project, immediately exit
-    if let Cli::New { name, .. } = &cli {
-        if let Err(err) = cli::new_project::new_project(&project_path, name.as_deref()) {
-            eprintln!("Failed to create project: {err:?}");
-        }
-        return Ok(());
-    }
-
-    // If UIC: write components to disk, immediately exit
-    #[cfg(not(feature = "production"))]
-    if let Cli::UpdateInterfaceComponents = cli {
-        let toml = shared::components::dev::build_components_toml().to_string();
-
-        // Assume we are being run within the codebase.
-        for guest_path in std::fs::read_dir("guest/").unwrap().filter_map(Result::ok).map(|de| de.path()).filter(|de| de.is_dir()) {
-            let toml_path = if guest_path.file_name().unwrap_or_default() == "rust" {
-                guest_path.join("api").join("api_macros").join("ambient.toml")
-            } else {
-                guest_path.join("api").join("ambient.toml")
-            };
-            std::fs::write(&toml_path, &toml)?;
-            log::info!("Interface updated at {toml_path:?}");
-        }
-        return Ok(());
-    }
-
-    // If a project was specified, assume that assets need to be built
-    let manifest = cli
-        .project()
-        .map(|_| {
-            anyhow::Ok(ambient_project::Manifest::parse(
-                &std::fs::read_to_string(project_path.join("ambient.toml")).context("No project manifest was found. Please create one.")?,
-            )?)
-        })
-        .transpose()?;
-
-    if let Some(manifest) = manifest.as_ref() {
-        let project_name = manifest.project.name.as_deref().unwrap_or("project");
-        log::info!("Building {}", project_name);
-        runtime.block_on(ambient_build::build(
-            PhysicsKey.get(&assets),
-            &assets,
-            project_path.clone(),
-            manifest,
-            cli.project().map(|p| p.release).unwrap_or(false),
-        ));
-        log::info!("Done building {}", project_name);
-    }
-
-    // If this is just a build, exit now
-    if matches!(&cli, Cli::Build { .. }) {
-        return Ok(());
-    }
-
-    // Otherwise, either connect to a server or host one
-    let server_addr = if let Cli::Join { host, .. } = &cli {
-        if let Some(mut host) = host.clone() {
-            if !host.contains(':') {
-                host = format!("{host}:{QUIC_INTERFACE_PORT}");
-            }
-            host.parse().with_context(|| format!("Invalid address for host {host}"))?
-        } else {
-            format!("127.0.0.1:{QUIC_INTERFACE_PORT}").parse()?
-        }
-    } else {
-        let port = server::start(&runtime, assets.clone(), cli.clone(), project_path, manifest.as_ref().expect("no manifest"));
-        format!("127.0.0.1:{port}").parse()?
-    };
-
-    // Time to join!
-    let handle = runtime.handle().clone();
-    if let Some(run) = cli.run() {
-        // If we have run parameters, start a client and join a server
-        runtime.block_on(client::run(assets, server_addr, run, cli.project().and_then(|p| p.path.clone())));
-    } else {
-        // Otherwise, wait for the Ctrl+C signal
-        handle.block_on(async move {
-            match tokio::signal::ctrl_c().await {
-                Ok(()) => {}
-                Err(err) => log::error!("Unable to listen for shutdown signal: {}", err),
-            }
-        });
-    }
-    Ok(())
+    let version = ambient_native_std::ambient_version();
+    sentry::init((
+        sentry_dsn.to_owned(),
+        sentry::ClientOptions {
+            release: Some(format!("{}_{}", version.version, version.revision).into()),
+            ..Default::default()
+        },
+    ))
 }

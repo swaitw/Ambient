@@ -2,26 +2,45 @@ use std::collections::HashSet;
 
 use ambient_ecs::{EntityId, PrimitiveComponent, Query, QueryState, World};
 
-use super::wit;
-
 pub type QueryStateMap =
     slotmap::SlotMap<slotmap::DefaultKey, (Query, QueryState, Vec<PrimitiveComponent>)>;
 
 #[derive(Clone, Default)]
 pub struct BindingsBase {
     pub spawned_entities: HashSet<EntityId>,
-    pub subscribed_events: HashSet<String>,
+    pub subscribed_messages: HashSet<String>,
     pub query_states: QueryStateMap,
 }
 
+/// Represents all the bindings for the imported world
 pub trait BindingsBound:
-    wit::types::Host
-    + wit::component::Host
-    + wit::entity::Host
-    + wit::event::Host
-    + wit::server_player::Host
-    + wit::server_physics::Host
-    + wit::server_asset::Host
+    // Lifetimes
+    'static
+    // Shared
+    + super::wit::types::Host
+    + super::wit::asset::Host
+    + super::wit::component::Host
+    + super::wit::entity::Host
+    + super::wit::message::Host
+    + super::wit::player::Host
+    + super::wit::ambient_package::Host
+    // Client
+    + super::wit::client_message::Host
+    + super::wit::client_player::Host
+    + super::wit::client_input::Host
+    + super::wit::client_camera::Host
+    + super::wit::client_clipboard::Host
+    + super::wit::client_window::Host
+    + super::wit::client_mesh::Host
+    + super::wit::client_texture::Host
+    + super::wit::client_sampler::Host
+    + super::wit::client_material::Host
+    // Server
+    + super::wit::server_asset::Host
+    + super::wit::server_message::Host
+    + super::wit::server_physics::Host
+    + super::wit::server_http::Host
+    + super::wit::server_ambient_package::Host
     + Clone
     + Sync
     + Send
@@ -40,6 +59,7 @@ impl Default for WorldRef {
         Self::new()
     }
 }
+
 impl WorldRef {
     const fn new() -> Self {
         WorldRef(std::ptr::null_mut())
@@ -57,5 +77,7 @@ impl WorldRef {
         self.0 = std::ptr::null_mut();
     }
 }
+
+/// TODO: safety
 unsafe impl Send for WorldRef {}
 unsafe impl Sync for WorldRef {}

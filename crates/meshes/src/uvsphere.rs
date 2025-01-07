@@ -4,7 +4,7 @@
 
 use std::f32::consts::PI;
 
-use ambient_std::mesh::Mesh;
+use ambient_native_std::mesh::{generate_tangents, Mesh, MeshBuilder};
 use glam::{vec2, vec3, Vec2, Vec3};
 use serde::{Deserialize, Serialize};
 
@@ -21,7 +21,11 @@ pub struct UVSphereMesh {
 
 impl Default for UVSphereMesh {
     fn default() -> Self {
-        Self { radius: 1.0, sectors: 36, stacks: 18 }
+        Self {
+            radius: 1.0,
+            sectors: 36,
+            stacks: 18,
+        }
     }
 }
 impl From<UVSphereMesh> for Mesh {
@@ -77,15 +81,16 @@ impl From<UVSphereMesh> for Mesh {
             }
         }
 
-        let mut mesh = Mesh {
-            name: format!("{sphere:?}"),
-            positions: Some(vertices),
+        let tangents = generate_tangents(&vertices, &uvs, &normals, &indices);
+        MeshBuilder {
+            positions: vertices,
+            normals,
+            tangents,
             texcoords: vec![uvs],
-            normals: Some(normals),
-            indices: Some(indices),
-            ..Default::default()
-        };
-        mesh.create_tangents();
-        mesh
+            indices,
+            ..MeshBuilder::default()
+        }
+        .build()
+        .expect("Invalid uv sphere mesh")
     }
 }

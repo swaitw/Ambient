@@ -1,13 +1,15 @@
 use std::ops::AddAssign;
 
 use cpal::{
-    traits::{DeviceTrait, HostTrait, StreamTrait}, OutputCallbackInfo, Sample
+    traits::{DeviceTrait, HostTrait, StreamTrait},
+    OutputCallbackInfo, Sample,
 };
 use itertools::Itertools;
 use slotmap::new_key_type;
 
 use crate::{
-    error::{Error, Result}, AudioMixer, ChannelCount, Frame, SampleRate, Source, WeakAudioMixer
+    error::{Error, Result},
+    AudioMixer, ChannelCount, Frame, SampleRate, Source, WeakAudioMixer,
 };
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -60,7 +62,7 @@ impl AudioStream {
         let format = config.sample_format();
         let config: cpal::StreamConfig = config.into();
 
-        tracing::info!("Audio stream config: {config:?}");
+        tracing::debug!("Audio stream config: {config:?}");
         if config.channels < 1 || config.channels > 2 {
             return Err(Error::InvalidChannelCount(config.channels));
         }
@@ -71,7 +73,7 @@ impl AudioStream {
 
         let weak_mixer = mixer.downgrade();
 
-        let err_func = |err| log::error!("Audio error: {err}");
+        let err_func = |err| tracing::error!("Audio error: {err}");
 
         let channels = mixer_config.channels;
 
